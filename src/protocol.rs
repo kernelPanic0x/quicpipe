@@ -3,6 +3,10 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use wincode::{Deserialize, SchemaRead, SchemaWrite, Serialize};
 
+pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
+pub const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024; // 16 MiB max in-memory window
+pub const ALPN: &'static str = "quicpipe/v1";
+
 pub trait Encoder: Sized {
     fn encode(&self) -> color_eyre::Result<Bytes>;
     fn decode(bytes: &[u8]) -> color_eyre::Result<Self>;
@@ -26,12 +30,22 @@ where
 #[derive(SchemaWrite, SchemaRead, Debug, Clone)]
 pub enum InletToOutlet {
     Data(Bytes),
-    Closed { reason: String },
+    EOF,
+    /// Ctrl+C
+    SIGINT,
+    ReadError(String),
+    Bye,
 }
 
 #[derive(SchemaWrite, SchemaRead, Debug, Clone)]
 pub enum OutletToInlet {
-    Closed { reason: String },
+    Received(u64),
+    /// Ctrl+C
+    SIGINT,
+    /// Outlet tried to write to closed pipe
+    SIGPIPE,
+    WriteError(String),
+    Bye,
 }
 
 #[derive(SchemaWrite, SchemaRead)]

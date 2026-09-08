@@ -1,14 +1,13 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre::{Context, eyre};
 use iroh::SecretKey;
-use std::{
-    io::{Read, stdin},
-    path::PathBuf,
-};
+use magic_wormhole::{AppID, Code, transfer::APP_CONFIG};
+use std::{borrow::Cow, io::Read, path::PathBuf, process::ExitCode};
 
 mod inlet;
 mod outlet;
 mod protocol;
+mod signal_handler;
 
 #[derive(Parser)]
 struct Cli {
@@ -19,24 +18,48 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Pipe inlet
-    Inlet {
-        #[arg(default_value = "-")]
-        path: PathBuf,
-    },
+    Inlet(InletArgs),
     /// Pipe outlet
-    Outlet {
-        #[arg(default_value = "-")]
-        path: PathBuf,
-    },
+    Outlet(OutletArgs),
     /// Generate an iroh secret key and print it to stdout.
     GenKey,
     /// Generate an iroh public key based a secret key read from stdin.
     GenPub,
 }
 
+#[derive(Debug, Clone, Args)]
+struct InletArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct OutletArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CommonArgs {
+    #[arg(default_value = "-")]
+    pub path: PathBuf,
+
+    /// Use a custom rendezvous server. Both sides need to use the same value in order to find each other.
+    #[arg(long, value_name = "ws://example.org", value_hint = clap::ValueHint::Url, env = "WORMHOLE_MAILBOX_URL")]
+    rendezvous_server: Option<url::Url>,
+
+    /// Manually set a fixed private key.
+    #[arg(long, env = "QUICPIPE_PRIVATE_KEY")]
+    private_key: Option<SecretKey>,
+
+    /// The wormhole code to establish a connection.
+    #[arg(long, short, env = "QUICPIPE_CODE")]
+    code: Option<Code>,
+}
+
 fn gen_public_key() -> color_eyre::Result<()> {
     let mut input = String::new();
-    stdin()
+    std::io::stdin()
         .read_to_string(&mut input)
         .context("Failed to read from stdin")?;
 
@@ -59,27 +82,27 @@ fn gen_secret_key() {
     println!("{hex}");
 }
 
-async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<i32> {
+async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<ExitCode> {
     let cli = match Cli::try_parse_from(argv) {
         Ok(app) => app,
         Err(err) => {
             // --help/--version print to stdout (code 0), usage errors to stderr (code 2)
             err.print()?;
-            return Ok(err.exit_code());
+            return Ok(ExitCode::from(err.exit_code() as u8));
         }
     };
 
     match cli.cmd {
-        Cmd::Inlet { path } => inlet::run().await?,
-        Cmd::Outlet { path } => todo!(),
+        Cmd::Inlet(args) => inlet::run(args).await?,
+        Cmd::Outlet(args) => outlet::run(args).await?,
         Cmd::GenKey => gen_secret_key(),
         Cmd::GenPub => gen_public_key()?,
     }
 
-    Ok(0)
+    Ok(ExitCode::SUCCESS)
 }
 
-pub async fn run_from<I, S>(args: I) -> i32
+pub async fn run_from<I, S>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
@@ -92,10 +115,20 @@ where
             .collect();
 
     match async_main(argv).await {
-        Ok(_) => 0,
+        Ok(code) => code,
         Err(report) => {
             eprintln!("{report:?}");
-            1
+            ExitCode::FAILURE
         }
     }
+}
+
+fn app_config(
+    common: &CommonArgs,
+) -> magic_wormhole::AppConfig<magic_wormhole::transfer::AppVersion> {
+    let mut config = APP_CONFIG.id(AppID::new("quicpipe-v1"));
+    if let Some(url) = &common.rendezvous_server {
+        config = config.rendezvous_url(Cow::Owned(url.to_string()));
+    }
+    config
 }
