@@ -1,22 +1,20 @@
 use std::pin::Pin;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
+use color_eyre::eyre::bail;
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use iroh::{EndpointAddr, PublicKey, SecretKey};
 use magic_wormhole::{MailboxConnection, Wormhole};
 use tokio::io::AsyncReadExt;
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::Notify;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::{fs::File, io::AsyncRead};
 
-use crate::protocol::{CHUNK_SIZE, Encoder, InletToOutlet};
-use crate::{
-    InletArgs, app_config,
-    protocol::{HandshakePayload, MAX_BUFFERED_BYTES},
-};
+use crate::protocol::{ALPN, CHUNK_SIZE, Encoder, InletToOutlet, OutletToInlet};
+use crate::{InletArgs, app_config, protocol::HandshakePayload};
 
 type ReaderType = Pin<Box<dyn AsyncRead + Send>>;
 
@@ -27,19 +25,36 @@ pub async fn run(args: InletArgs) -> color_eyre::Result<()> {
         Box::pin(File::open(&args.common.path).await?)
     };
 
-    let link = Link::connect(args).await?;
+    let (from_outlet_tx, mut from_outlet_rx) = tokio::sync::mpsc::channel::<OutletToInlet>(1);
+    let link = Link::connect(args, from_outlet_tx).await?;
 
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
+    let mut cancel_requests = 0;
+
+    let mut inlet_bytes: u64 = 0;
+    let mut outlet_bytes: u64 = 0;
 
     loop {
         select! {
             _ = sigint.recv() => {
                 link.send(InletToOutlet::SIGINT).await;
+                eprintln!("Shutting down...");
+                cancel_requests += 1;
+                if cancel_requests > 2 {
+                    eprintln!("Exiting now!");
+                    std::process::exit(130); // 128 + SIGINT
+                }
             }
 
-            _ = link.wait_for_bye() => {
-                break;
+            msg = from_outlet_rx.recv() => {
+                match msg.expect("Outlet TX") {
+                    OutletToInlet::Received(n) => todo!(),
+                    OutletToInlet::SIGINT => bail!("SIGINT on outlet!"),
+                    OutletToInlet::SIGPIPE => bail!("SIGPIPE on outlet!"),
+                    OutletToInlet::WriteError(e) => bail!("Write error on outlet: {}", e),
+                    OutletToInlet::Bye => break,
+                }
             }
 
             // Read stdin or file
@@ -47,6 +62,7 @@ pub async fn run(args: InletArgs) -> color_eyre::Result<()> {
                 Ok(n) if n == 0 => link.send(InletToOutlet::EOF).await,
                 Ok(_) => {
                     let chunk = buf.split().freeze();
+                    inlet_bytes += chunk.len() as u64;
                     link.send(InletToOutlet::Data(chunk)).await;
                 },
                 Err(e) => link.send(InletToOutlet::ReadError(e.to_string())).await,
@@ -59,11 +75,13 @@ pub async fn run(args: InletArgs) -> color_eyre::Result<()> {
 #[derive(Clone)]
 struct Link {
     tx: Sender<Bytes>,
-    bye_signal: Arc<Notify>,
 }
 
 impl Link {
-    async fn connect(args: InletArgs) -> color_eyre::Result<Self> {
+    async fn connect(
+        args: InletArgs,
+        from_outlet_tx: Sender<OutletToInlet>,
+    ) -> color_eyre::Result<Self> {
         let secret_key = args
             .common
             .private_key
@@ -71,12 +89,8 @@ impl Link {
             .unwrap_or_else(SecretKey::generate);
         let public_key = secret_key.public();
 
-        let mailbox = MailboxConnection::connect(
-            app_config(&args.common),
-            args.common.code.expect("code always set"),
-            false,
-        )
-        .await?;
+        let mailbox = MailboxConnection::create(app_config(&args.common), args.code_length).await?;
+        eprintln!("Wormhole code: {}", mailbox.code());
         let mut wormhole = Wormhole::connect(mailbox).await?;
         let bytes = wormhole.receive().await?;
         let payload: HandshakePayload = wincode::deserialize(&bytes)?;
@@ -106,13 +120,44 @@ impl Link {
             .bind()
             .await?;
 
-        let mut target_addr = EndpointAddr::new(PublicKey::from_bytes(&payload.public_key)?);
+        let mut addr = EndpointAddr::new(PublicKey::from_bytes(&payload.public_key)?);
         if let Some(relay_str) = payload.relay_url {
-            target_addr = target_addr.with_relay_url(relay_str.parse()?);
+            addr = addr.with_relay_url(relay_str.parse()?);
         }
 
         for ip in payload.direct_addresses {
-            target_addr = target_addr.with_ip_addr(ip);
+            addr = addr.with_ip_addr(ip);
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+
+        tokio::spawn(async move { loop {} });
+
+        Ok(Self { tx })
+    }
+
+    async fn handle_connection(
+        mut rx: Receiver<Bytes>,
+        from_outlet_tx: &mut Sender<OutletToInlet>,
+        endpoint: &Endpoint,
+        addr: EndpointAddr,
+    ) -> color_eyre::Result<()> {
+        let connection = endpoint.connect(addr, ALPN.as_bytes()).await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let mut buf = BytesMut::new();
+
+        select! {
+            chunk = rx.recv() => {
+                match chunk {
+                    Some(c) => send.write_chunk(c).await?,
+                    None => return Ok(()),
+                }
+            }
+            res = recv.read_buf(&mut buf) => {
+                let _ = res?;
+                let msg = OutletToInlet::decode(&buf.split())?;
+                from_outlet_tx.send(msg).await?;
+            }
         }
 
         todo!()
@@ -123,34 +168,5 @@ impl Link {
             .tx
             .send(msg.encode().expect("Encoding can't fail"))
             .await;
-    }
-
-    pub async fn wait_for_bye(&self) {
-        self.bye_signal.notified().await
-    }
-}
-
-struct BufferManager {
-    current_chunk: Bytes,
-    offset: u64,
-}
-
-impl BufferManager {
-    pub fn default() -> Self {
-        Self {
-            buffer: BytesMut::with_capacity(MAX_BUFFERED_BYTES),
-            offset: 0,
-        }
-    }
-
-    pub fn put(&mut self, chunk: Bytes) {
-        self.offset = self.offset.strict_add(chunk.len() as u64);
-        self.current_chunk = chunk;
-    }
-
-    pub fn advance(&mut self, remote_offset: u64) {
-        if remote_offset > self.offset {
-            self.buffer.advance(cnt);
-        }
     }
 }

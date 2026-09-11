@@ -7,7 +7,6 @@ use std::{borrow::Cow, io::Read, path::PathBuf, process::ExitCode};
 mod inlet;
 mod outlet;
 mod protocol;
-mod signal_handler;
 
 #[derive(Parser)]
 struct Cli {
@@ -31,6 +30,10 @@ enum Cmd {
 struct InletArgs {
     #[command(flatten)]
     common: CommonArgs,
+
+    /// Wormhole code length
+    #[arg(long, short = 'l', default_value_t = 2)]
+    pub code_length: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -41,6 +44,7 @@ struct OutletArgs {
 
 #[derive(Debug, Clone, Args)]
 struct CommonArgs {
+    /// Path or '-' for stdin/stdout
     #[arg(default_value = "-")]
     pub path: PathBuf,
 
@@ -51,10 +55,6 @@ struct CommonArgs {
     /// Manually set a fixed private key.
     #[arg(long, env = "QUICPIPE_PRIVATE_KEY")]
     private_key: Option<SecretKey>,
-
-    /// The wormhole code to establish a connection.
-    #[arg(long, short, env = "QUICPIPE_CODE")]
-    code: Option<Code>,
 }
 
 fn gen_public_key() -> color_eyre::Result<()> {
@@ -82,13 +82,13 @@ fn gen_secret_key() {
     println!("{hex}");
 }
 
-async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<ExitCode> {
+async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<i32> {
     let cli = match Cli::try_parse_from(argv) {
         Ok(app) => app,
         Err(err) => {
             // --help/--version print to stdout (code 0), usage errors to stderr (code 2)
             err.print()?;
-            return Ok(ExitCode::from(err.exit_code() as u8));
+            return Ok(err.exit_code());
         }
     };
 
@@ -99,10 +99,10 @@ async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<ExitCod
         Cmd::GenPub => gen_public_key()?,
     }
 
-    Ok(ExitCode::SUCCESS)
+    Ok(0)
 }
 
-pub async fn run_from<I, S>(args: I) -> ExitCode
+pub async fn run_from<I, S>(args: I) -> i32
 where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
@@ -118,7 +118,7 @@ where
         Ok(code) => code,
         Err(report) => {
             eprintln!("{report:?}");
-            ExitCode::FAILURE
+            1
         }
     }
 }
@@ -126,7 +126,7 @@ where
 fn app_config(
     common: &CommonArgs,
 ) -> magic_wormhole::AppConfig<magic_wormhole::transfer::AppVersion> {
-    let mut config = APP_CONFIG.id(AppID::new("quicpipe-v1"));
+    let mut config = APP_CONFIG.id(AppID::new(concat!(env!("CARGO_PKG_NAME"), "-v1")));
     if let Some(url) = &common.rendezvous_server {
         config = config.rendezvous_url(Cow::Owned(url.to_string()));
     }
