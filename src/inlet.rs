@@ -1,172 +1,263 @@
-use std::pin::Pin;
-use std::process::ExitCode;
-use std::sync::Arc;
+//! The producer side: source, replay window, reconnect loop. It never re-reads
+//! its source, so stdin and a seekable file are handled identically.
 
-use bytes::{Buf, Bytes, BytesMut};
-use color_eyre::eyre::bail;
-use iroh::{Endpoint, RelayMode, endpoint::presets};
-use iroh::{EndpointAddr, PublicKey, SecretKey};
+use std::collections::VecDeque;
+
+use bytes::Bytes;
+use color_eyre::eyre::{Result, eyre};
+use iroh::endpoint::{Connection, Endpoint};
+use iroh::{PublicKey, SecretKey};
 use magic_wormhole::{MailboxConnection, Wormhole};
-use tokio::io::AsyncReadExt;
 use tokio::select;
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::{fs::File, io::AsyncRead};
+use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
 
-use crate::protocol::{ALPN, CHUNK_SIZE, Encoder, InletToOutlet, OutletToInlet};
-use crate::{InletArgs, app_config, protocol::HandshakePayload};
+use crate::protocol::*;
+use crate::replay::Window;
+use crate::{InletArgs, app_config, link, net, signals, source};
 
-type ReaderType = Pin<Box<dyn AsyncRead + Send>>;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+const CTRL_GRACE: Duration = Duration::from_secs(3);
 
-pub async fn run(args: InletArgs) -> color_eyre::Result<()> {
-    let mut reader: ReaderType = if args.common.path.as_os_str() == "-" {
-        Box::pin(tokio::io::stdin())
-    } else {
-        Box::pin(File::open(&args.common.path).await?)
-    };
+enum Session {
+    /// Everything sent and acknowledged.
+    Done,
+    PeerBye,
+    Interrupted,
+    /// The peer's stdout is gone, so ours should die of SIGPIPE too.
+    SigPipe,
+    Fatal(String),
+}
 
-    let (from_outlet_tx, mut from_outlet_rx) = tokio::sync::mpsc::channel::<OutletToInlet>(1);
-    let link = Link::connect(args, from_outlet_tx).await?;
+/// "The connection went away" — the one thing worth retrying.
+struct Lost(String);
 
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
-    let mut cancel_requests = 0;
+pub async fn run(args: InletArgs) -> Result<()> {
+    let common = &args.common;
+    let key = common
+        .private_key
+        .clone()
+        .unwrap_or_else(SecretKey::generate);
+    let endpoint = net::bind(&key, true).await?;
 
-    let mut inlet_bytes: u64 = 0;
-    let mut outlet_bytes: u64 = 0;
+    let mailbox = MailboxConnection::create(app_config(common), args.code_length).await?;
+    eprintln!("{}", mailbox.code());
+    eprintln!("[quicpipe] waiting for the other end...");
+    let mut wormhole = Wormhole::connect(mailbox).await?;
+    wormhole
+        .send(wincode::serialize(&net::payload_for(&endpoint, &key))?)
+        .await?;
+    let peer: HandshakePayload = wincode::deserialize(&wormhole.receive().await?)?;
+    let peer_id = PublicKey::from_bytes(&peer.public_key)?;
+    eprintln!("[quicpipe] peer is {}", peer_id.fmt_short());
+
+    let mut source = source::spawn(&common.path, 2)?;
+    let (signal_tx, mut signal_rx) = mpsc::channel(1);
+    signals::forward(signal_tx);
+
+    let mut window = Window::new(MAX_BUFFERED_BYTES as u64);
+    let mut source_done = false;
 
     loop {
-        select! {
-            _ = sigint.recv() => {
-                link.send(InletToOutlet::SIGINT).await;
-                eprintln!("Shutting down...");
-                cancel_requests += 1;
-                if cancel_requests > 2 {
-                    eprintln!("Exiting now!");
-                    std::process::exit(130); // 128 + SIGINT
-                }
-            }
-
-            msg = from_outlet_rx.recv() => {
-                match msg.expect("Outlet TX") {
-                    OutletToInlet::Received(n) => todo!(),
-                    OutletToInlet::SIGINT => bail!("SIGINT on outlet!"),
-                    OutletToInlet::SIGPIPE => bail!("SIGPIPE on outlet!"),
-                    OutletToInlet::WriteError(e) => bail!("Write error on outlet: {}", e),
-                    OutletToInlet::Bye => break,
-                }
-            }
-
-            // Read stdin or file
-            res = reader.read_buf(&mut buf) => match res {
-                Ok(n) if n == 0 => link.send(InletToOutlet::EOF).await,
-                Ok(_) => {
-                    let chunk = buf.split().freeze();
-                    inlet_bytes += chunk.len() as u64;
-                    link.send(InletToOutlet::Data(chunk)).await;
-                },
-                Err(e) => link.send(InletToOutlet::ReadError(e.to_string())).await,
-            }
-        }
-    }
-    todo!()
-}
-
-#[derive(Clone)]
-struct Link {
-    tx: Sender<Bytes>,
-}
-
-impl Link {
-    async fn connect(
-        args: InletArgs,
-        from_outlet_tx: Sender<OutletToInlet>,
-    ) -> color_eyre::Result<Self> {
-        let secret_key = args
-            .common
-            .private_key
-            .clone()
-            .unwrap_or_else(SecretKey::generate);
-        let public_key = secret_key.public();
-
-        let mailbox = MailboxConnection::create(app_config(&args.common), args.code_length).await?;
-        eprintln!("Wormhole code: {}", mailbox.code());
-        let mut wormhole = Wormhole::connect(mailbox).await?;
-        let bytes = wormhole.receive().await?;
-        let payload: HandshakePayload = wincode::deserialize(&bytes)?;
-
-        wormhole.send(public_key.to_vec()).await?;
-
-        #[cfg(target_os = "android")]
-        let endpoint = {
-            use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-
-            use iroh::dns::DnsResolver;
-
-            Endpoint::builder(presets::Minimal)
-                .secret_key(secret_key)
-                .dns_resolver(DnsResolver::with_nameserver(SocketAddr::V4(
-                    SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53),
-                )))
-                .relay_mode(RelayMode::Default)
-                .bind()
-                .await?
+        let Some(conn) = accept(&endpoint, peer_id, &mut signal_rx).await else {
+            return Ok(());
         };
 
-        #[cfg(not(target_os = "android"))]
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(secret_key)
-            .relay_mode(RelayMode::Default)
-            .bind()
-            .await?;
-
-        let mut addr = EndpointAddr::new(PublicKey::from_bytes(&payload.public_key)?);
-        if let Some(relay_str) = payload.relay_url {
-            addr = addr.with_relay_url(relay_str.parse()?);
+        match session(
+            &conn,
+            &mut window,
+            &mut source.rx,
+            &mut source_done,
+            &mut signal_rx,
+        )
+        .await
+        {
+            Ok(Session::Done) | Ok(Session::PeerBye) => return Ok(()),
+            Ok(Session::Interrupted) => signals::die_of(libc::SIGINT),
+            Ok(Session::SigPipe) => signals::die_of(libc::SIGPIPE),
+            Ok(Session::Fatal(msg)) => return Err(eyre!(msg)),
+            Err(Lost(reason)) => {
+                eprintln!("[quicpipe] connection lost: {reason}; waiting for a reconnect");
+            }
         }
-
-        for ip in payload.direct_addresses {
-            addr = addr.with_ip_addr(ip);
-        }
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(1);
-
-        tokio::spawn(async move { loop {} });
-
-        Ok(Self { tx })
     }
+}
 
-    async fn handle_connection(
-        mut rx: Receiver<Bytes>,
-        from_outlet_tx: &mut Sender<OutletToInlet>,
-        endpoint: &Endpoint,
-        addr: EndpointAddr,
-    ) -> color_eyre::Result<()> {
-        let connection = endpoint.connect(addr, ALPN.as_bytes()).await?;
-        let (mut send, mut recv) = connection.open_bi().await?;
-        let mut buf = BytesMut::new();
+/// Accepts only connections from the endpoint we rendezvoused with.
+async fn accept(
+    endpoint: &Endpoint,
+    peer: PublicKey,
+    signals: &mut mpsc::Receiver<()>,
+) -> Option<Connection> {
+    loop {
+        let incoming = select! {
+            biased;
+            _ = signals.recv() => return None,
+            incoming = endpoint.accept() => incoming?,
+        };
+        let conn = match incoming.accept() {
+            Ok(connecting) => match connecting.await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    eprintln!("[quicpipe] handshake failed: {e}");
+                    continue;
+                }
+            },
+            Err(e) => {
+                // Retransmitted datagrams can produce failures we may ignore.
+                eprintln!("[quicpipe] dropped incoming connection: {e}");
+                continue;
+            }
+        };
+        if conn.remote_id() != peer {
+            eprintln!(
+                "[quicpipe] ignoring {}; waiting for {}",
+                conn.remote_id().fmt_short(),
+                peer.fmt_short()
+            );
+            continue;
+        }
+        return Some(conn);
+    }
+}
+
+async fn session(
+    conn: &Connection,
+    window: &mut Window,
+    source: &mut mpsc::Receiver<source::Msg>,
+    source_done: &mut bool,
+    signals: &mut mpsc::Receiver<()>,
+) -> Result<Session, Lost> {
+    let (send, recv) = conn.accept_bi().await.map_err(|e| Lost(e.to_string()))?;
+
+    let (to_outlet_tx, to_outlet_rx) = mpsc::channel::<InletToOutlet>(2);
+    let (from_outlet_tx, mut from_outlet_rx) = mpsc::channel::<OutletToInlet>(4);
+    let (faults_tx, mut faults_rx) = mpsc::channel::<String>(2);
+
+    link::read_half(recv, from_outlet_tx, faults_tx.clone());
+    let writer = link::write_half(send, to_outlet_rx, faults_tx.clone());
+
+    // The first frame is the outlet saying how much it has written, which is
+    // also exactly where it wants us to resume from.
+    let resume_from = match timeout(HANDSHAKE_TIMEOUT, from_outlet_rx.recv()).await {
+        Ok(Some(OutletToInlet::Received(n))) => n,
+        Ok(Some(other)) => return Err(Lost(format!("expected the resume point, got {other:?}"))),
+        Ok(None) => return Err(Lost("outlet left before greeting".into())),
+        Err(_) => return Err(Lost("outlet did not greet us in time".into())),
+    };
+
+    let mut backlog: VecDeque<(u64, Bytes)> = match window.replay_from(resume_from) {
+        Ok(chunks) => chunks.into(),
+        Err(out_of_range) => {
+            // Bytes are gone. Inventing them would silently corrupt the stream,
+            // so refuse loudly and let the exit code carry the verdict.
+            let msg = out_of_range.to_string();
+            eprintln!("[quicpipe] {msg}");
+            let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Fatal(msg.clone())))
+                .await;
+            drop(to_outlet_tx);
+            let _ = timeout(CTRL_GRACE, writer).await;
+            return Ok(Session::Fatal(msg));
+        }
+    };
+
+    // The resume point is acknowledged: the bytes below it can leave the window
+    // and the accounting after a reconnect starts from where the peer is.
+    window.ack(resume_from);
+
+    eprintln!(
+        "[quicpipe] outlet connected; replaying from byte {resume_from} \
+         ({} chunks buffered, {} unacknowledged)",
+        backlog.len(),
+        window.unacked()
+    );
+
+    let mut eof_queued = false;
+    let outcome: Result<Session, Lost> = 'session: loop {
+        // All control frames are delivered here, with an await, so none of them
+        // can be lost to a full channel. The body runs after the select has
+        // completed, so a brief await can only delay Lost detection, never
+        // corrupt framing: each frame is tiny and the writer forwards promptly.
+        // Top-of-loop, so it fires even when the final ack arrived in the same
+        // iteration as the last data frame.
+        if *source_done && !eof_queued && backlog.is_empty() {
+            // EOF goes first and alone: everything the source produced is now
+            // either buffered for replay or already sent, so the true end of
+            // the stream is this exact frame — however many connections it
+            // takes to deliver it.
+            let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::EOF)).await;
+            eof_queued = true;
+        }
+        if *source_done && eof_queued && window.unacked() == 0 {
+            let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Bye)).await;
+            break 'session Ok(Session::Done);
+        }
+
+        // Replay strictly before new bytes: order is the contract, and the
+        // source is only read once the backlog is drained and the window has
+        // room. That guard is the backpressure.
+        let can_replay = !backlog.is_empty() && to_outlet_tx.capacity() > 0;
+        let has_room = !window.is_full() && to_outlet_tx.capacity() > 0;
+        let can_pull = !*source_done && has_room && backlog.is_empty();
 
         select! {
-            chunk = rx.recv() => {
-                match chunk {
-                    Some(c) => send.write_chunk(c).await?,
-                    None => return Ok(()),
+            biased;
+
+            // A stream task died, which means the connection is gone.
+            Some(fault) = faults_rx.recv() => break 'session Err(Lost(fault)),
+
+            _ = signals.recv() => {
+                let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::SIGINT)).await;
+                break 'session Ok(Session::Interrupted);
+            }
+
+            Some(msg) = from_outlet_rx.recv() => match msg {
+                OutletToInlet::Received(n) => window.ack(n),
+                OutletToInlet::Bye => break 'session Ok(Session::PeerBye),
+                OutletToInlet::SIGINT => break 'session Ok(Session::Interrupted),
+                OutletToInlet::SIGPIPE => break 'session Ok(Session::SigPipe),
+            },
+
+            _ = std::future::ready(()), if can_replay => {
+                if let Some((offset, payload)) = backlog.pop_front() {
+                    let _ = to_outlet_tx.try_send(InletToOutlet::Data { offset, payload });
                 }
             }
-            res = recv.read_buf(&mut buf) => {
-                let _ = res?;
-                let msg = OutletToInlet::decode(&buf.split())?;
-                from_outlet_tx.send(msg).await?;
-            }
+
+            // Exactly one branch may touch the source. `select!` evaluates every
+            // branch's async expression before polling any of them, so a second
+            // `source.recv()` would be a second simultaneous `&mut *source` —
+            // and a disabled branch is still evaluated.
+            msg = source.recv(), if can_pull => match msg {
+                Some(source::Msg::Data(chunk)) => {
+                    let (offset, payload) = window.push(chunk);
+                    let _ = to_outlet_tx.try_send(InletToOutlet::Data { offset, payload });
+                }
+                Some(source::Msg::Eof) => {
+                    *source_done = true;
+                }
+                Some(source::Msg::Error(e)) => {
+                    let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Fatal(e.clone()))).await;
+                    break 'session Ok(Session::Fatal(e));
+                }
+                // The only sender lives inside the source thread, so a closed
+                // channel with neither `Eof` nor `Error` means it died
+                // abnormally. The stream may be truncated, and claiming a clean
+                // EOF for a truncated stream is the one lie worth avoiding.
+                None => {
+                    let msg = "source thread exited without finishing".to_string();
+                    let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Fatal(msg.clone()))).await;
+                    break 'session Ok(Session::Fatal(msg));
+                }
+            },
+
+            _ = conn.closed() => break 'session Err(Lost("connection closed".into())),
         }
+    };
 
-        todo!()
-    }
-
-    pub async fn send(&self, msg: InletToOutlet) {
-        let _ = self
-            .tx
-            .send(msg.encode().expect("Encoding can't fail"))
-            .await;
-    }
+    // Dropping the sender ends the writer task, which flushes and finishes the
+    // stream. Waiting for it means a queued `Bye` or `Fatal` still lands.
+    drop(to_outlet_tx);
+    let _ = timeout(CTRL_GRACE, writer).await;
+    outcome
 }

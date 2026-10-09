@@ -2,11 +2,18 @@ use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre::{Context, eyre};
 use iroh::SecretKey;
 use magic_wormhole::{AppID, Code, transfer::APP_CONFIG};
-use std::{borrow::Cow, io::Read, path::PathBuf, process::ExitCode};
+use std::{borrow::Cow, io::Read, path::PathBuf};
 
+mod completer;
 mod inlet;
+mod link;
+mod net;
 mod outlet;
 mod protocol;
+mod replay;
+mod signals;
+mod sink;
+mod source;
 
 #[derive(Parser)]
 struct Cli {
@@ -55,6 +62,10 @@ struct CommonArgs {
     /// Manually set a fixed private key.
     #[arg(long, env = "QUICPIPE_PRIVATE_KEY")]
     private_key: Option<SecretKey>,
+
+    /// The wormhole code to establish a connection.
+    #[arg(long, short, env = "RESCUE_SHELL_CODE")]
+    code: Option<Code>,
 }
 
 fn gen_public_key() -> color_eyre::Result<()> {
