@@ -18,8 +18,6 @@ use tokio::sync::mpsc;
 
 use crate::protocol::InletToOutlet;
 
-
-
 #[derive(Debug)]
 pub enum Msg {
     Data {
@@ -66,19 +64,12 @@ impl Sink {
         let join = thread::Builder::new()
             .name("quicpipe-sink".into())
             .spawn(move || writer(path, rx, cursor, events))?;
-        Ok((
-            Sink {
-                tx,
-                written,
-            },
-            join,
-        ))
+        Ok((Sink { tx, written }, join))
     }
 
     /// How far stdout has actually advanced. This is the resume request.
     pub fn cursor(&self) -> u64 {
-        self.written
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.written.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -89,10 +80,7 @@ pub async fn drain(sink: &Sink, within: std::time::Duration) -> Option<u64> {
         sink.tx.send(Msg::Barrier(tx)).await.ok()?;
         rx.await.ok()
     };
-    tokio::time::timeout(within, barrier)
-        .await
-        .ok()
-        .flatten()
+    tokio::time::timeout(within, barrier).await.ok().flatten()
 }
 
 fn writer(

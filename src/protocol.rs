@@ -7,7 +7,7 @@ use wincode::{Deserialize, SchemaRead, SchemaWrite, Serialize};
 
 pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 pub const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024; // 16 MiB max in-memory window
-pub const ALPN: &'static str = "quicpipe/v1";
+pub const ALPN: &str = "quicpipe/v1";
 
 pub trait Encoder: Sized {
     fn encode(&self) -> color_eyre::Result<Bytes>;
@@ -81,6 +81,7 @@ impl<T: Encoder> Decoder for WireCodec<T> {
 }
 
 #[derive(SchemaWrite, SchemaRead, Debug, Clone)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum InletToOutlet {
     /// A slice of the byte stream, tagged with its absolute offset so a replayed
     /// chunk is recognised rather than written twice.
@@ -97,6 +98,7 @@ pub enum InletToOutlet {
     Bye,
 }
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(SchemaWrite, SchemaRead, Debug, Clone)]
 pub enum OutletToInlet {
     /// "Everything below this offset has been written to stdout."

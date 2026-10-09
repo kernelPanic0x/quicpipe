@@ -153,8 +153,11 @@ async fn session(
             // so refuse loudly and let the exit code carry the verdict.
             let msg = out_of_range.to_string();
             eprintln!("[quicpipe] {msg}");
-            let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Fatal(msg.clone())))
-                .await;
+            let _ = timeout(
+                CTRL_GRACE,
+                to_outlet_tx.send(InletToOutlet::Fatal(msg.clone())),
+            )
+            .await;
             drop(to_outlet_tx);
             let _ = timeout(CTRL_GRACE, writer).await;
             return Ok(Session::Fatal(msg));

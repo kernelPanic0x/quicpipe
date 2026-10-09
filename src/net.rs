@@ -11,7 +11,7 @@ use iroh::endpoint::{Endpoint, presets};
 use iroh::{RelayMode, SecretKey};
 use tokio::sync::mpsc;
 
-use crate::protocol::{HandshakePayload, ALPN};
+use crate::protocol::{ALPN, HandshakePayload};
 
 /// How long to wait for the peer to confirm it received a finished stream. A
 /// `Bye` or `Fatal` still in flight must not be discarded by teardown.
@@ -59,10 +59,7 @@ pub async fn dial(
 
 // Waiting for a retry must stay responsive to Ctrl-C, so the sleep races the
 // signal channel rather than blocking on it.
-pub async fn wait_for_retry(
-    delay: std::time::Duration,
-    signals: &mut mpsc::Receiver<()>,
-) -> bool {
+pub async fn wait_for_retry(delay: std::time::Duration, signals: &mut mpsc::Receiver<()>) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(delay) => true,
         _ = signals.recv() => false,

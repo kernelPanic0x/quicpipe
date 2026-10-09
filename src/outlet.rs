@@ -18,6 +18,12 @@ use crate::{OutletArgs, app_config, link, net, signals};
 
 const SINK_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a control-frame send may wait for the writer to take it before we
+/// treat the connection as wedged. `mpsc::Sender::send` is cancel-safe, so a
+/// timed-out send is *guaranteed* not to have delivered the frame: no silent
+/// loss, the caller always knows.
+const CTRL_GRACE: Duration = Duration::from_secs(3);
+
 enum Session {
     Done,
     PeerBye,
@@ -27,6 +33,14 @@ enum Session {
 }
 
 struct Lost(String);
+
+/// Sends a control frame, waiting up to `CTRL_GRACE` for the writer to take
+/// it. Returns false if the frame could not be queued in time (writer wedged
+/// or session torn down) — the caller must then treat the frame as undelivered
+/// rather than assume it went out.
+async fn send_ctrl(tx: &mpsc::Sender<OutletToInlet>, msg: OutletToInlet) -> bool {
+    !matches!(timeout(CTRL_GRACE, tx.send(msg)).await, Err(_) | Ok(Err(_)))
+}
 
 pub async fn run(mut args: OutletArgs) -> Result<()> {
     let key = args
@@ -80,7 +94,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
                 }
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         };
         attempt = 0;
 
@@ -141,7 +155,11 @@ async fn session(
             // Local first, so Ctrl-C and a broken downstream are reported
             // promptly even while the stream is saturated.
             _ = signals.recv() => {
-                let _ = to_inlet_tx.try_send(OutletToInlet::SIGINT);
+                // The producer's Ctrl-C must reach the inlet: the source dies
+                // of SIGINT, so this goodbye is its only way to learn. Awaited
+                // (bounded) so it cannot be silently dropped by a wedged
+                // writer.
+                let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGINT).await;
                 break 'session Ok(Session::Interrupted);
             }
 
@@ -153,9 +171,12 @@ async fn session(
                 }
                 SinkEvent::BrokenPipe => {
                     // Our consumer is gone. Tell the inlet so its producer dies
-                    // too, then die like a pipe ourselves.
-                    let _ = to_inlet_tx.try_send(OutletToInlet::SIGPIPE);
-                    let _ = to_inlet_tx.try_send(OutletToInlet::Bye);
+                    // too, then die like a pipe ourselves. Both frames are
+                    // awaited (bounded): this goodbye is the producer's only
+                    // SIGPIPE, so it must not be silently dropped by a wedged
+                    // writer.
+                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGPIPE).await;
+                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await;
                     break 'session Ok(Session::BrokenPipe);
                 }
                 SinkEvent::Gap { expected, got } => {
@@ -169,19 +190,75 @@ async fn session(
 
             Some(msg) = from_inlet_rx.recv() => match msg {
                 InletToOutlet::EOF => {
-                    // Let the sink finish the tail, then report the true final
-                    // offset so the inlet's window can close cleanly.
-                    let drained = select! {
-                        biased;
-                        Some(f) = faults_rx.recv() => break 'session Err(Lost(f)),
-                        _ = signals.recv() => break 'session Ok(Session::Interrupted),
-                        n = sink::drain(sink, SINK_DRAIN_TIMEOUT) => n,
+                    // Let the sink finish the tail. Deliberately *no* timeout:
+                    // a slow consumer is the downstream's own backpressure,
+                    // exactly as with an ordinary pipe, and exiting before the
+                    // tail is written would hang the inlet's window forever.
+                    // Instead the drain races the sink's own failure, so a
+                    // dead consumer surfaces here as SIGPIPE rather than
+                    // hanging the barrier.
+                    let final_offset = 'drain: loop {
+                        select! {
+                            biased;
+
+                            Some(f) = faults_rx.recv() => break 'session Err(Lost(f)),
+
+                            Some(event) = events.recv() => match event {
+                                SinkEvent::BrokenPipe => {
+                                    // The consumer exited mid-tail. What it
+                                    // consumed is the true final count, and
+                                    // the producer upstream must get SIGPIPE.
+                                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGPIPE).await;
+                                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await;
+                                    break 'session Ok(Session::BrokenPipe);
+                                }
+                                SinkEvent::Error(e) => break 'session Ok(Session::Fatal(e)),
+                                SinkEvent::Ack(n) => {
+                                    // A write during the drain advanced the
+                                    // cursor. The final `Received` below
+                                    // covers it, but forward late acks so the
+                                    // greeting of a reconnect stays truthful.
+                                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Received(n)).await;
+                                }
+                                _ => {}
+                            },
+
+                            _ = signals.recv() => break 'session Ok(Session::Interrupted),
+                            _ = conn.closed() => {
+                                break 'session Err(Lost(
+                                    "connection closed while draining the tail".into(),
+                                ))
+                            }
+                            n = sink::drain(sink, Duration::MAX) => break 'drain n,
+                        }
                     };
-                    if let Some(n) = drained {
-                        let _ = to_inlet_tx.send(OutletToInlet::Received(n)).await;
+                    let final_offset = match final_offset {
+                        Some(n) => n,
+                        None => {
+                            break 'session Ok(Session::Fatal(
+                                "sink stopped before the tail was written".into(),
+                            ))
+                        }
+                    };
+
+                    // The goodbye is the inlet's only way to reach `Done`, so
+                    // it must be delivered: both frames are awaited, and a
+                    // failure breaks `Lost` instead of ending the session
+                    // silently. On reconnect the greeting restates the same
+                    // cursor, so the handshake converges.
+                    if !send_ctrl(&to_inlet_tx, OutletToInlet::Received(final_offset)).await {
+                        break 'session Err(Lost("could not deliver the final ack".into()));
                     }
-                    let _ = to_inlet_tx.try_send(OutletToInlet::Bye);
-                    let _ = sink.tx.try_send(sink::Msg::Eof);
+                    if !send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await {
+                        break 'session Err(Lost("could not deliver the goodbye".into()));
+                    }
+
+                    // All data is written, so the sink takes EOF immediately.
+                    // If it somehow cannot, fail loudly instead of parking the
+                    // final `join` in `run` forever.
+                    if timeout(CTRL_GRACE, sink.tx.send(sink::Msg::Eof)).await.is_err() {
+                        break 'session Ok(Session::Fatal("sink did not accept EOF".into()));
+                    }
                     break 'session Ok(Session::Done);
                 }
                 InletToOutlet::SIGINT => break 'session Ok(Session::Interrupted),

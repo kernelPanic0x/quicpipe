@@ -5,7 +5,9 @@
 //!
 //! The invariant that makes it safe:
 //!
-//!     base <= acknowledged <= the outlet's written offset = the resume request
+//! ```text
+//! base <= acknowledged <= the outlet's written offset = the resume request
+//! ```
 //!
 //! `base` advances only on an ack, and the outlet only ever asks to resume from
 //! a value it previously reported as written, so a well-behaved outlet cannot
