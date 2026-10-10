@@ -64,7 +64,7 @@ struct CommonArgs {
     private_key: Option<SecretKey>,
 
     /// The wormhole code to establish a connection.
-    #[arg(long, short, env = "RESCUE_SHELL_CODE")]
+    #[arg(long, short, env = "QUICPIPE_WORMHOLE_CODE")]
     code: Option<Code>,
 }
 

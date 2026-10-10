@@ -46,7 +46,7 @@ pub async fn run(args: InletArgs) -> Result<()> {
     let endpoint = net::bind(&key, true).await?;
 
     let mailbox = MailboxConnection::create(app_config(common), args.code_length).await?;
-    eprintln!("{}", mailbox.code());
+    eprintln!("Wormhole Code: {}", mailbox.code());
     eprintln!("[quicpipe] waiting for the other end...");
     let mut wormhole = Wormhole::connect(mailbox).await?;
     wormhole
