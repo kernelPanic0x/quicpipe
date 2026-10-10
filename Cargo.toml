@@ -3,6 +3,13 @@ name = "quicpipe"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+incremental = false
+
 [dependencies]
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive", "env"] }
