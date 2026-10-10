@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, eyre};
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, PublicKey, SecretKey};
 use magic_wormhole::{MailboxConnection, Wormhole};
@@ -18,6 +18,16 @@ use crate::{OutletArgs, app_config, link, net, signals};
 
 const SINK_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long to keep the connection open after announcing cancellation, waiting
+/// for the peer to close back (proof the SIGINT frame was delivered). Only then
+/// is the connection closed as a backstop.
+const PEER_CLOSE_GRACE: Duration = Duration::from_secs(3);
+
+/// How many consecutive reconnects the outlet tolerates after a lost
+/// connection before concluding the inlet is gone for good. An idle timeout on
+/// a live network recovers well within this; a hard-killed inlet never will.
+const MAX_RECONNECTS: u32 = 10;
+
 /// How long a control-frame send may wait for the writer to take it before we
 /// treat the connection as wedged. `mpsc::Sender::send` is cancel-safe, so a
 /// timed-out send is *guaranteed* not to have delivered the frame: no silent
@@ -27,6 +37,10 @@ const CTRL_GRACE: Duration = Duration::from_secs(3);
 enum Session {
     Done,
     PeerBye,
+    /// The *peer* was cancelled (SIGINT/SIGTERM): the stream is over but did
+    /// not complete. This must surface as an error, not a clean exit.
+    PeerCancelled,
+    /// We ourselves were cancelled.
     Interrupted,
     BrokenPipe,
     Fatal(String),
@@ -83,29 +97,49 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
     signals::forward(signal_tx);
 
     let mut attempt = 0u32;
+    let mut lost_attempts = 0u32;
     loop {
         let conn = match net::dial(&endpoint, addr.clone()).await {
-            Ok(conn) => conn,
+            Ok(conn) => {
+                // A successful dial proves the inlet is reachable again; the
+                // reconnect budget starts over.
+                attempt = 0;
+                lost_attempts = 0;
+                conn
+            }
             Err(e) if net::transient(&e) => {
                 attempt += 1;
+                lost_attempts += 1;
+                if lost_attempts > MAX_RECONNECTS {
+                    return Err(eyre!(
+                        "cannot reach the inlet after {MAX_RECONNECTS} attempts: {e}"
+                    ));
+                }
                 eprintln!("[quicpipe] connect failed: {e}; retrying");
                 if !net::wait_for_retry(net::backoff(attempt), &mut signal_rx).await {
-                    return Ok(());
+                    // Cancelled while retrying: exit like a signal handler.
+                    signals::die_of(libc::SIGINT);
                 }
                 continue;
             }
             Err(e) => return Err(e),
         };
-        attempt = 0;
 
         match session(&conn, &sink, &mut events_rx, &mut signal_rx).await {
             Ok(Session::Done) | Ok(Session::PeerBye) => {
                 // The sink may still be flushing the tail; let it finish so the
-                // last bytes reach the consumer. The sink runs on its own
-                // thread, so drain first (bounded), then join that thread.
-                sink::drain(&sink, SINK_DRAIN_TIMEOUT).await;
-                let _ = tokio::task::spawn_blocking(move || sink_task.join()).await;
+                // last bytes reach the consumer.
+                finish_sink(&sink, sink_task).await;
                 return Ok(());
+            }
+            Ok(Session::PeerCancelled) => {
+                // The bytes received so far are a clean prefix: flush them,
+                // but the exit must stay loud — the stream did not complete.
+                finish_sink(&sink, sink_task).await;
+                return Err(eyre!(
+                    "the inlet cancelled the transfer (SIGINT); \
+                     the stream did not complete"
+                ));
             }
             Ok(Session::Interrupted) => signals::die_of(libc::SIGINT),
             Ok(Session::BrokenPipe) => signals::die_of(libc::SIGPIPE),
@@ -114,13 +148,81 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
                 return Err(color_eyre::eyre::eyre!(msg));
             }
             Err(Lost(reason)) => {
-                eprintln!("[quicpipe] connection lost: {reason}; reconnecting");
-                if !net::wait_for_retry(Duration::from_millis(200), &mut signal_rx).await {
-                    return Ok(());
+                lost_attempts += 1;
+                // First ask the connection why it ended. An application close
+                // means the inlet made a final decision and must not be
+                // second-guessed by a reconnect — this is what keeps the
+                // outlet from redialling an inlet that exited via Ctrl+C.
+                match net::close_kind(&conn).await {
+                    net::CloseKind::App(net::close::CANCEL, _) => {
+                        // The bytes received so far are a clean prefix: flush
+                        // them, but the exit must stay loud — the stream did
+                        // not complete.
+                        finish_sink(&sink, sink_task).await;
+                        return Err(eyre!(
+                            "the inlet cancelled the transfer (SIGINT); \
+                             the stream did not complete"
+                        ));
+                    }
+                    net::CloseKind::App(net::close::SIGPIPE, _) => signals::die_of(libc::SIGPIPE),
+                    net::CloseKind::App(net::close::FATAL, r) => {
+                        return Err(eyre!("inlet reported a fatal error: {r}"));
+                    }
+                    net::CloseKind::App(net::close::DONE, r) => {
+                        // A clean close is only clean if the inlet had already
+                        // said `EOF`; a `DONE` arriving without it means the
+                        // stream ended early. Distinguish loudly.
+                        eprintln!("[quicpipe] inlet closed the connection: {r}");
+                        finish_sink(&sink, sink_task).await;
+                        return Ok(());
+                    }
+                    net::CloseKind::App(_, r) => {
+                        eprintln!("[quicpipe] inlet closed the connection: {r}");
+                        finish_sink(&sink, sink_task).await;
+                        return Ok(());
+                    }
+                    net::CloseKind::TimedOut => {
+                        // Only an ordinary network failure may be retried.
+                        if lost_attempts > MAX_RECONNECTS {
+                            return Err(eyre!(
+                                "connection lost {MAX_RECONNECTS} times without the \
+                                 inlet coming back; giving up (timed out)"
+                            ));
+                        }
+                        eprintln!("[quicpipe] connection lost: {reason}; reconnecting");
+                        if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
+                        {
+                            signals::die_of(libc::SIGINT);
+                        }
+                    }
+                    net::CloseKind::Lost(why) => {
+                        // Only an ordinary network failure may be retried.
+                        if lost_attempts > MAX_RECONNECTS {
+                            return Err(eyre!(
+                                "connection lost {MAX_RECONNECTS} times without the \
+                                 inlet coming back; giving up ({why})"
+                            ));
+                        }
+                        eprintln!("[quicpipe] connection lost: {reason}; reconnecting");
+                        if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
+                        {
+                            signals::die_of(libc::SIGINT);
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Lets the sink flush the tail, then joins its thread. The sink runs on its
+/// own thread, so drain first (bounded), then join.
+async fn finish_sink(
+    sink: &sink::Sink,
+    sink_task: std::thread::JoinHandle<()>,
+) {
+    sink::drain(sink, SINK_DRAIN_TIMEOUT).await;
+    let _ = tokio::task::spawn_blocking(move || sink_task.join()).await;
 }
 
 async fn session(
@@ -261,7 +363,7 @@ async fn session(
                     }
                     break 'session Ok(Session::Done);
                 }
-                InletToOutlet::SIGINT => break 'session Ok(Session::Interrupted),
+                InletToOutlet::SIGINT => break 'session Ok(Session::PeerCancelled),
                 InletToOutlet::Fatal(msg) => break 'session Ok(Session::Fatal(msg)),
                 InletToOutlet::Bye => break 'session Ok(Session::PeerBye),
                 InletToOutlet::Data { .. } => {
@@ -276,5 +378,35 @@ async fn session(
 
     drop(to_inlet_tx);
     let _ = timeout(Duration::from_secs(3), writer).await;
+
+    // Announce the verdict at the transport level. For cancellation the
+    // connection must NOT be closed right away: `close` discards stream data
+    // that has not been acked, which could destroy the in-flight SIGINT frame.
+    // Wait for the peer to close back first; close as a backstop otherwise.
+    match &outcome {
+        Ok(Session::Interrupted) => {
+            if timeout(PEER_CLOSE_GRACE, conn.closed()).await.is_err() {
+                net::close_intentional(conn, net::close::CANCEL, "SIGINT");
+                tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+            }
+        }
+        Ok(Session::Done | Session::PeerBye) => {
+            net::close_intentional(conn, net::close::DONE, "done");
+            tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+        }
+        Ok(Session::PeerCancelled) => {
+            net::close_intentional(conn, net::close::CANCEL, "SIGINT");
+            tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+        }
+        Ok(Session::BrokenPipe) => {
+            net::close_intentional(conn, net::close::SIGPIPE, "SIGPIPE");
+            tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+        }
+        Ok(Session::Fatal(msg)) => {
+            net::close_intentional(conn, net::close::FATAL, &msg[..msg.len().min(256)]);
+            tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+        }
+        Err(Lost(_)) => {} // the connection is already gone
+    }
     outcome
 }

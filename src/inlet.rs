@@ -19,6 +19,11 @@ use crate::{InletArgs, app_config, link, net, signals, source};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const CTRL_GRACE: Duration = Duration::from_secs(3);
 
+/// How long to keep the connection open after announcing cancellation, waiting
+/// for the peer to close back (proof the SIGINT frame was delivered). Only then
+/// is the connection closed as a backstop.
+const PEER_CLOSE_GRACE: Duration = Duration::from_secs(3);
+
 enum Session {
     /// Everything sent and acknowledged.
     Done,
@@ -60,7 +65,9 @@ pub async fn run(args: InletArgs) -> Result<()> {
 
     loop {
         let Some(conn) = accept(&endpoint, peer_id, &mut signal_rx).await else {
-            return Ok(());
+            // Cancelled while waiting for a connection: die like a signal
+            // handler should, so the exit code says 130, not 0.
+            signals::die_of(libc::SIGINT);
         };
 
         match session(
@@ -77,8 +84,41 @@ pub async fn run(args: InletArgs) -> Result<()> {
             Ok(Session::SigPipe) => signals::die_of(libc::SIGPIPE),
             Ok(Session::Fatal(msg)) => return Err(eyre!(msg)),
             Err(Lost(reason)) => {
-                eprintln!("[quicpipe] connection lost: {reason}; waiting for a reconnect");
+                // A lost connection is only worth waiting on if the peer did
+                // not leave on purpose: its close code is the definitive
+                // verdict, surviving even a lost in-band control frame.
+                match net::close_kind(&conn).await {
+                    net::CloseKind::App(net::close::DONE, _) => return Ok(()),
+                    net::CloseKind::App(net::close::CANCEL, _) => signals::die_of(libc::SIGINT),
+                    net::CloseKind::App(net::close::SIGPIPE, _) => signals::die_of(libc::SIGPIPE),
+                    net::CloseKind::App(net::close::FATAL, r) => {
+                        return Err(eyre!("outlet reported a fatal error: {r}"));
+                    }
+                    net::CloseKind::App(code, r) => {
+                        eprintln!("[quicpipe] outlet closed the connection ({code}: {r})");
+                        return Ok(());
+                    }
+                    net::CloseKind::TimedOut | net::CloseKind::Lost(_) => {
+                        eprintln!("[quicpipe] connection lost: {reason}; waiting for a reconnect");
+                    }
+                }
             }
+        }
+    }
+}
+
+/// Queues a control frame on a possibly congested channel: the writer drains
+/// it continuously, so poll until it accepts the frame instead of betting on a
+/// single timed send.
+async fn queue_ctrl(tx: &mpsc::Sender<InletToOutlet>, msg: InletToOutlet) {
+    let deadline = tokio::time::Instant::now() + CTRL_GRACE;
+    loop {
+        match tx.try_send(msg.clone()) {
+            Ok(()) => return,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            Err(_) => return, // session torn down; the close code takes over
         }
     }
 }
@@ -153,6 +193,7 @@ async fn session(
             // so refuse loudly and let the exit code carry the verdict.
             let msg = out_of_range.to_string();
             eprintln!("[quicpipe] {msg}");
+            net::close_intentional(conn, net::close::FATAL, "fatal");
             let _ = timeout(
                 CTRL_GRACE,
                 to_outlet_tx.send(InletToOutlet::Fatal(msg.clone())),
@@ -210,7 +251,11 @@ async fn session(
             Some(fault) = faults_rx.recv() => break 'session Err(Lost(fault)),
 
             _ = signals.recv() => {
-                let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::SIGINT)).await;
+                // The channel may be jammed with data frames queued behind a
+                // congested stream; the writer drains it continuously, so poll
+                // until it takes the cancellation frame instead of betting on
+                // a single timed send.
+                queue_ctrl(&to_outlet_tx, InletToOutlet::SIGINT).await;
                 break 'session Ok(Session::Interrupted);
             }
 
@@ -262,5 +307,35 @@ async fn session(
     // stream. Waiting for it means a queued `Bye` or `Fatal` still lands.
     drop(to_outlet_tx);
     let _ = timeout(CTRL_GRACE, writer).await;
+
+    // Announce the verdict at the transport level. For cancellation the
+    // connection must NOT be closed right away: `close` discards stream data
+    // that has not been acked, which could destroy the in-flight SIGINT frame.
+    // The stream is the reliable channel (QUIC retransmits it until acked), so
+    // cancellation waits for the peer to close back; everything else closes as
+    // a backstop announcing the verdict even if the in-band frame was lost.
+    match &outcome {
+        Ok(Session::Interrupted) => {
+            if timeout(PEER_CLOSE_GRACE, conn.closed()).await.is_err() {
+                net::close_intentional(conn, net::close::CANCEL, "SIGINT");
+                tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+            }
+        }
+        Ok(Session::Done | Session::PeerBye) => {
+            net::close_intentional(conn, net::close::DONE, "done");
+            tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+        }
+        Ok(Session::SigPipe) => {
+            net::close_intentional(conn, net::close::SIGPIPE, "SIGPIPE");
+            tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+        }
+        Ok(Session::Fatal(msg)) => {
+            // The close reason carries the message; QUIC truncates it to fit a
+            // packet, so keep it short.
+            net::close_intentional(conn, net::close::FATAL, &msg[..msg.len().min(256)]);
+            tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+        }
+        Err(Lost(_)) => {} // the connection is already gone
+    }
     outcome
 }
