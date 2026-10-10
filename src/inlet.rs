@@ -39,10 +39,7 @@ struct Lost(String);
 
 pub async fn run(args: InletArgs) -> Result<()> {
     let common = &args.common;
-    let key = common
-        .private_key
-        .clone()
-        .unwrap_or_else(SecretKey::generate);
+    let key = SecretKey::generate();
     let endpoint = net::bind(&key, true).await?;
 
     let mailbox = MailboxConnection::create(app_config(common), args.code_length).await?;

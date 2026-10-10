@@ -47,6 +47,10 @@ struct InletArgs {
 struct OutletArgs {
     #[command(flatten)]
     common: CommonArgs,
+
+    /// The wormhole code to establish a connection.
+    #[arg(long, short, env = "QUICPIPE_CODE")]
+    code: Option<Code>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -58,14 +62,6 @@ struct CommonArgs {
     /// Use a custom rendezvous server. Both sides need to use the same value in order to find each other.
     #[arg(long, value_name = "ws://example.org", value_hint = clap::ValueHint::Url, env = "WORMHOLE_MAILBOX_URL")]
     rendezvous_server: Option<url::Url>,
-
-    /// Manually set a fixed private key.
-    #[arg(long, env = "QUICPIPE_PRIVATE_KEY")]
-    private_key: Option<SecretKey>,
-
-    /// The wormhole code to establish a connection.
-    #[arg(long, short, env = "QUICPIPE_WORMHOLE_CODE")]
-    code: Option<Code>,
 }
 
 fn gen_public_key() -> color_eyre::Result<()> {

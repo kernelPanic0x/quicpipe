@@ -57,20 +57,16 @@ async fn send_ctrl(tx: &mpsc::Sender<OutletToInlet>, msg: OutletToInlet) -> bool
 }
 
 pub async fn run(mut args: OutletArgs) -> Result<()> {
-    let key = args
-        .common
-        .private_key
-        .clone()
-        .unwrap_or_else(SecretKey::generate);
+    let key = SecretKey::generate();
     let endpoint = net::bind(&key, false).await?;
 
-    if args.common.code.is_none() {
-        args.common.code = Some(enter_code()?.parse()?);
+    if args.code.is_none() {
+        args.code = Some(enter_code()?.parse()?);
     }
 
     let mailbox = MailboxConnection::connect(
         app_config(&args.common),
-        args.common.code.expect("Code set").clone(),
+        args.code.expect("Code set").clone(),
         false,
     )
     .await?;
@@ -190,8 +186,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
                             ));
                         }
                         eprintln!("[quicpipe] connection lost: {reason}; reconnecting");
-                        if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
-                        {
+                        if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await {
                             signals::die_of(libc::SIGINT);
                         }
                     }
@@ -204,8 +199,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
                             ));
                         }
                         eprintln!("[quicpipe] connection lost: {reason}; reconnecting");
-                        if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
-                        {
+                        if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await {
                             signals::die_of(libc::SIGINT);
                         }
                     }
@@ -217,10 +211,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
 
 /// Lets the sink flush the tail, then joins its thread. The sink runs on its
 /// own thread, so drain first (bounded), then join.
-async fn finish_sink(
-    sink: &sink::Sink,
-    sink_task: std::thread::JoinHandle<()>,
-) {
+async fn finish_sink(sink: &sink::Sink, sink_task: std::thread::JoinHandle<()>) {
     sink::drain(sink, SINK_DRAIN_TIMEOUT).await;
     let _ = tokio::task::spawn_blocking(move || sink_task.join()).await;
 }
