@@ -94,12 +94,31 @@ pub const FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// with "peer doesn't support any known protocol". The dialing side needs no
 /// `alpns`, the protocol name rides on `connect`.
 pub async fn bind(key: &SecretKey, accept: bool) -> Result<Endpoint> {
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(key.clone())
-        .relay_mode(RelayMode::Default);
+    // FIX: We don't hava an adroid context in termux, use google DNS.
+    #[cfg(target_os = "android")]
+    let mut builder = {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+        use iroh::dns::DnsResolver;
+
+        Endpoint::builder(presets::Minimal)
+            .secret_key(key.clone())
+            .dns_resolver(DnsResolver::with_nameserver(SocketAddr::V4(
+                SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53),
+            )))
+            .relay_mode(RelayMode::Default)
+    };
+    #[cfg(not(target_os = "android"))]
+    let mut builder = {
+        Endpoint::builder(presets::Minimal)
+            .secret_key(key.clone())
+            .relay_mode(RelayMode::Default)
+    };
+
     if accept {
         builder = builder.alpns(vec![ALPN.as_bytes().to_vec()]);
     }
+
     Ok(builder.bind().await?)
 }
 
