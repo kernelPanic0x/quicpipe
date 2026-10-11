@@ -9,16 +9,78 @@
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Buy_me_a_coffee-ff5f5f?style=flat&logo=ko-fi&logoColor=white)](https://ko-fi.com/kernelpanic0x)
 [![Donate](https://img.shields.io/badge/Donate_Crypto-F7931A?style=flat&logo=bitcoin&logoColor=white)](#-donations)
 
-
-Create a unix pipe between two computer over an unstable connection.
-
 </div>
+
+Create a unix pipe between two computers over an unstable connection.
+
+`quicpipe` forwards stdin/stdout (or a file) from one machine to another over an **end-to-end encrypted QUIC connection**, surviving NATs, firewalls, and unstable links. The rendezvous happens over [magic-wormhole](https://github.com/magic-wormhole/magic-wormhole) — you only exchange a short human-readable code — while the data itself travels peer-to-peer via [iroh](https://github.com/n0-computer/iroh), with a relay fallback if a direct connection is not possible.
+
+Because it behaves like a pipe, it composes with everything the unix shell already gives you:
+
+```sh
+producer | quicpipe inlet | consumer
+```
+
+Pipes that die like real pipes: `quicpipe` dies by `SIGPIPE`/`SIGINT` just like any other unix tool, so `producer | quicpipe inlet | consumer` behaves exactly as you'd expect — no wedged connections, no half-dead upstreams.
+
+## 🔧 How it works
+
+- **`quicpipe inlet`** — the receiving side. Listens for a connection and writes whatever arrives to stdout (or a file). It prints a wormhole code you pass to the other side.
+- **`quicpipe outlet`** — the sending side. Connects with the wormhole code and streams stdin (or a file) to the inlet. Pass the code with `-c`, the `QUICPIPE_CODE` environment variable, or enter it interactively when prompted.
+
+The wormhole code is only used to exchange the iroh endpoint addresses and public keys, securely and out-of-band. All pipe data flows directly between the two machines, end-to-end encrypted. If a direct connection fails, an encrypted relay is used automatically. Reconnects survive NAT rebinds and changing interfaces, so flaky links don't kill your transfer.
+
+## 🚀 Usage
+
+### Stream a file to another machine
+
+On the receiving machine:
+
+```sh
+quicpipe inlet > backup.tar.gz
+```
+
+This prints a wormhole code, e.g. `7-crimson-otter`. On the sending machine:
+
+```sh
+quicpipe outlet -c 7-crimson-otter < backup.tar.gz
+```
+
+### Stream a live command output
+
+Anything you can pipe, you can send. On the receiving side:
+
+```sh
+quicpipe inlet | tar xz
+```
+
+On the sending side:
+
+```sh
+tar cz . | quicpipe outlet -c 7-crimson-otter
+```
+
+### Work with files instead of stdin/stdout
+
+Both sides accept a path argument instead of the default `-` (stdin/stdout):
+
+```sh
+# sending side
+quicpipe outlet -c 7-crimson-otter dump.sql
+
+# receiving side
+quicpipe inlet restored.sql
+```
+
+## 🐚 Embedded in rescue-shell
+
+`quicpipe` is also embedded as a subcommand in [rescue-shell](https://github.com/kernelPanic0x/rescue-shell) (`rescue-shell quicpipe ...`), so a rescue session always has a pipe available without installing anything else.
 
 ## 🏗️ Build from Source
 
 ```sh
-git clone https://github.com/kernelPanic0x/rescue-shell
-cd rescue-shell
+git clone https://github.com/kernelPanic0x/quicpipe
+cd quicpipe
 cargo build --release
 ```
 
@@ -55,5 +117,3 @@ cargo build --release
 
 </div>
 </details>
-
-
