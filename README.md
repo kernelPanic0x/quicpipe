@@ -25,8 +25,8 @@ Pipes that die like real pipes: `quicpipe` dies by `SIGPIPE`/`SIGINT` just like 
 
 ## 🔧 How it works
 
-- **`quicpipe inlet`** — the receiving side. Listens for a connection and writes whatever arrives to stdout (or a file). It prints a wormhole code you pass to the other side.
-- **`quicpipe outlet`** — the sending side. Connects with the wormhole code and streams stdin (or a file) to the inlet. Pass the code with `-c`, the `QUICPIPE_CODE` environment variable, or enter it interactively when prompted.
+- **`quicpipe inlet`** — the sending side. Reads stdin (or a file) and streams it to the outlet. It accepts the connection and prints a wormhole code you pass to the other side.
+- **`quicpipe outlet`** — the receiving side. Connects with the wormhole code and writes whatever arrives to stdout (or a file). Pass the code with `-c`, the `QUICPIPE_CODE` environment variable, or enter it interactively when prompted.
 
 The wormhole code is only used to exchange the iroh endpoint addresses and public keys, securely and out-of-band. All pipe data flows directly between the two machines, end-to-end encrypted. If a direct connection fails, an encrypted relay is used automatically. Reconnects survive NAT rebinds and changing interfaces, so flaky links don't kill your transfer.
 
@@ -34,30 +34,30 @@ The wormhole code is only used to exchange the iroh endpoint addresses and publi
 
 ### Stream a file to another machine
 
+On the sending machine (this prints a wormhole code, e.g. `7-crimson-otter`):
+
+```sh
+quicpipe inlet < backup.tar.gz
+```
+
 On the receiving machine:
 
 ```sh
-quicpipe inlet > backup.tar.gz
-```
-
-This prints a wormhole code, e.g. `7-crimson-otter`. On the sending machine:
-
-```sh
-quicpipe outlet -c 7-crimson-otter < backup.tar.gz
+quicpipe outlet -c 7-crimson-otter > backup.tar.gz
 ```
 
 ### Stream a live command output
 
-Anything you can pipe, you can send. On the receiving side:
+Anything you can pipe, you can send. On the sending side:
 
 ```sh
-quicpipe inlet | tar xz
+tar cz . | quicpipe inlet
 ```
 
-On the sending side:
+On the receiving side:
 
 ```sh
-tar cz . | quicpipe outlet -c 7-crimson-otter
+quicpipe outlet -c 7-crimson-otter | tar xz
 ```
 
 ### Work with files instead of stdin/stdout
@@ -66,10 +66,10 @@ Both sides accept a path argument instead of the default `-` (stdin/stdout):
 
 ```sh
 # sending side
-quicpipe outlet -c 7-crimson-otter dump.sql
+quicpipe inlet dump.sql
 
 # receiving side
-quicpipe inlet restored.sql
+quicpipe outlet -c 7-crimson-otter restored.sql
 ```
 
 ## 🐚 Embedded in rescue-shell
