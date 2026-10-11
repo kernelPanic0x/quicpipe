@@ -3,8 +3,10 @@ name = "quicpipe"
 version = "0.1.0"
 edition = "2024"
 
-# Used when quicpipe is built as a standalone binary (outside this workspace).
-# Inside the rescue-shell workspace the root [profile.release] applies instead.
+# This package is also a member of the rescue-shell workspace. Keep the
+# dependency versions in sync with rescue-shell's [workspace.dependencies]
+# so both share one version per crate via the workspace lockfile.
+
 [profile.release]
 opt-level = "z"
 lto = true
@@ -13,17 +15,26 @@ strip = true
 incremental = false
 
 [dependencies]
-bytes = { workspace = true }
-clap = { workspace = true }
-clio = { workspace = true }
-color-eyre = { workspace = true }
-dialoguer = { workspace = true }
-futures-util = { workspace = true }
-hex = { workspace = true }
-iroh = { workspace = true }
-libc = { workspace = true }
-magic-wormhole = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-url = { workspace = true }
-wincode = { workspace = true }
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["std", "derive", "env"] }
+clio = { version = "0.3.5", features = ["clap-parse"] }
+color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
+dialoguer = { version = "0.12.0", features = ["completion"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+hex = "0.4.3"
+iroh = { version = "1.1.0", features = ["unstable-net-report"] }
+libc = "0.2.189"
+magic-wormhole = "0.8.1"
+tokio = { version = "1.53.1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "fs",
+  "time",
+  "sync",
+  "signal",
+] }
+tokio-util = { version = "0.7.19", features = ["codec"] }
+url = { version = "2.5.8", default-features = false }
+wincode = { version = "0.6.1", features = ["bytes", "derive"] }
