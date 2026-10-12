@@ -15,6 +15,20 @@ mod signals;
 mod sink;
 mod source;
 
+/// Initialize logging: `RUST_LOG` wins if set, otherwise `--quiet` maps to
+/// error-only, otherwise errors from any crate plus quicpipe status lines.
+/// Everything goes to stderr, never to stdout (stdout is the pipe payload).
+pub fn init_logging(quiet: bool) {
+    let default_filter = if quiet {
+        "error"
+    } else {
+        "error,quicpipe=info"
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+}
+
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -62,7 +76,10 @@ struct CommonArgs {
     /// Use a custom rendezvous server. Both sides need to use the same value in order to find each other.
     #[arg(long, value_name = "ws://example.org", value_hint = clap::ValueHint::Url, env = "WORMHOLE_MAILBOX_URL")]
     rendezvous_server: Option<url::Url>,
-}
+
+    /// Silence status output (errors only). RUST_LOG overrides this.
+    #[arg(long, short)]
+    pub quiet: bool,}
 
 fn gen_public_key() -> color_eyre::Result<()> {
     let mut input = String::new();
@@ -100,8 +117,14 @@ async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<i32> {
     };
 
     match cli.cmd {
-        Cmd::Inlet(args) => inlet::run(args).await?,
-        Cmd::Outlet(args) => outlet::run(args).await?,
+        Cmd::Inlet(args) => {
+            init_logging(args.common.quiet);
+            inlet::run(args).await?
+        }
+        Cmd::Outlet(args) => {
+            init_logging(args.common.quiet);
+            outlet::run(args).await?
+        }
         Cmd::GenKey => gen_secret_key(),
         Cmd::GenPub => gen_public_key()?,
     }

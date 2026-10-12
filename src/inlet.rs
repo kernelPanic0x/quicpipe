@@ -44,14 +44,14 @@ pub async fn run(args: InletArgs) -> Result<()> {
 
     let mailbox = MailboxConnection::create(app_config(common), args.code_length).await?;
     eprintln!("Wormhole Code: {}", mailbox.code());
-    eprintln!("[quicpipe] waiting for the other end...");
+    tracing::info!("waiting for the other end...");
     let mut wormhole = Wormhole::connect(mailbox).await?;
     wormhole
         .send(wincode::serialize(&net::payload_for(&endpoint, &key))?)
         .await?;
     let peer: HandshakePayload = wincode::deserialize(&wormhole.receive().await?)?;
     let peer_id = PublicKey::from_bytes(&peer.public_key)?;
-    eprintln!("[quicpipe] peer is {}", peer_id.fmt_short());
+    tracing::info!("peer is {}", peer_id.fmt_short());
 
     let mut source = source::spawn(&common.path, 2)?;
     let (signal_tx, mut signal_rx) = mpsc::channel(1);
@@ -92,11 +92,11 @@ pub async fn run(args: InletArgs) -> Result<()> {
                         return Err(eyre!("outlet reported a fatal error: {r}"));
                     }
                     net::CloseKind::App(code, r) => {
-                        eprintln!("[quicpipe] outlet closed the connection ({code}: {r})");
+                        tracing::warn!("outlet closed the connection ({code}: {r})");
                         return Ok(());
                     }
                     net::CloseKind::TimedOut | net::CloseKind::Lost(_) => {
-                        eprintln!("[quicpipe] connection lost: {reason}; waiting for a reconnect");
+                        tracing::warn!("connection lost: {reason}; waiting for a reconnect");
                     }
                 }
             }
@@ -136,19 +136,19 @@ async fn accept(
             Ok(connecting) => match connecting.await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    eprintln!("[quicpipe] handshake failed: {e}");
+                    tracing::warn!("handshake failed: {e}");
                     continue;
                 }
             },
             Err(e) => {
                 // Retransmitted datagrams can produce failures we may ignore.
-                eprintln!("[quicpipe] dropped incoming connection: {e}");
+                tracing::debug!("dropped incoming connection: {e}");
                 continue;
             }
         };
         if conn.remote_id() != peer {
-            eprintln!(
-                "[quicpipe] ignoring {}; waiting for {}",
+            tracing::debug!(
+                "ignoring {}; waiting for {}",
                 conn.remote_id().fmt_short(),
                 peer.fmt_short()
             );
@@ -189,7 +189,7 @@ async fn session(
             // Bytes are gone. Inventing them would silently corrupt the stream,
             // so refuse loudly and let the exit code carry the verdict.
             let msg = out_of_range.to_string();
-            eprintln!("[quicpipe] {msg}");
+            tracing::error!("{msg}");
             net::close_intentional(conn, net::close::FATAL, "fatal");
             let _ = timeout(
                 CTRL_GRACE,
@@ -206,8 +206,8 @@ async fn session(
     // and the accounting after a reconnect starts from where the peer is.
     window.ack(resume_from);
 
-    eprintln!(
-        "[quicpipe] outlet connected; replaying from byte {resume_from} \
+    tracing::info!(
+        "outlet connected; replaying from byte {resume_from} \
          ({} chunks buffered, {} unacknowledged)",
         backlog.len(),
         window.unacked()

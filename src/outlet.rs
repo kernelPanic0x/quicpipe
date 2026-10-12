@@ -84,7 +84,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
     for ip in &peer.direct_addresses {
         addr = addr.with_ip_addr(*ip);
     }
-    eprintln!("[quicpipe] connecting to {}", peer_id.fmt_short());
+    tracing::info!("connecting to {}", peer_id.fmt_short());
 
     let (events_tx, mut events_rx) = mpsc::channel::<SinkEvent>(64);
     let (sink, sink_task) = sink::Sink::spawn(&args.common.path, 2, events_tx)?;
@@ -111,7 +111,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
                         "cannot reach the inlet after {MAX_RECONNECTS} attempts: {e}"
                     ));
                 }
-                eprintln!("[quicpipe] connect failed: {e}; retrying");
+                tracing::warn!("connect failed: {e}; retrying");
                 if !net::wait_for_retry(net::backoff(attempt), &mut signal_rx).await {
                     // Cancelled while retrying: exit like a signal handler.
                     signals::die_of(libc::SIGINT);
@@ -140,7 +140,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
             Ok(Session::Interrupted) => signals::die_of(libc::SIGINT),
             Ok(Session::BrokenPipe) => signals::die_of(libc::SIGPIPE),
             Ok(Session::Fatal(msg)) => {
-                eprintln!("[quicpipe] {msg}");
+                tracing::error!("{msg}");
                 return Err(color_eyre::eyre::eyre!(msg));
             }
             Err(Lost(reason)) => {
@@ -168,12 +168,12 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
                         // A clean close is only clean if the inlet had already
                         // said `EOF`; a `DONE` arriving without it means the
                         // stream ended early. Distinguish loudly.
-                        eprintln!("[quicpipe] inlet closed the connection: {r}");
+                        tracing::warn!("inlet closed the connection: {r}");
                         finish_sink(&sink, sink_task).await;
                         return Ok(());
                     }
                     net::CloseKind::App(_, r) => {
-                        eprintln!("[quicpipe] inlet closed the connection: {r}");
+                        tracing::warn!("inlet closed the connection: {r}");
                         finish_sink(&sink, sink_task).await;
                         return Ok(());
                     }
@@ -185,7 +185,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
                                  inlet coming back; giving up (timed out)"
                             ));
                         }
-                        eprintln!("[quicpipe] connection lost: {reason}; reconnecting");
+                        tracing::warn!("connection lost: {reason}; reconnecting");
                         if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await {
                             signals::die_of(libc::SIGINT);
                         }
@@ -198,7 +198,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
                                  inlet coming back; giving up ({why})"
                             ));
                         }
-                        eprintln!("[quicpipe] connection lost: {reason}; reconnecting");
+                        tracing::warn!("connection lost: {reason}; reconnecting");
                         if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await {
                             signals::die_of(libc::SIGINT);
                         }
@@ -239,7 +239,7 @@ async fn session(
         .send(OutletToInlet::Received(cursor))
         .await
         .map_err(|_| Lost("inlet left immediately".into()))?;
-    eprintln!("[quicpipe] connected; resuming at byte {cursor}");
+    tracing::info!("connected; resuming at byte {cursor}");
 
     let outcome: Result<Session, Lost> = 'session: loop {
         select! {

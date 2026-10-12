@@ -72,6 +72,12 @@ quicpipe inlet dump.sql
 quicpipe outlet -c 7-crimson-otter restored.sql
 ```
 
+You can also set the wormhole code via the environment: `QUICPIPE_CODE`, and the rendezvous server via `WORMHOLE_MAILBOX_URL`.
+
+### Output control
+
+Status messages go to stderr (stdout is reserved for pipe data). By default only quicpipe's own status lines (and errors from any library) are printed; use `--quiet`/`-q` to silence everything but errors, or set `RUST_LOG` for finer control (e.g. `RUST_LOG=debug` also shows iroh's internals for troubleshooting).
+
 ## 🐚 Embedded in rescue-shell
 
 `quicpipe` is also embedded as a subcommand in [rescue-shell](https://github.com/kernelPanic0x/rescue-shell) (`rescue-shell quicpipe ...`), so a rescue session always has a pipe available without installing anything else.

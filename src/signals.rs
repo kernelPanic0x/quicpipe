@@ -18,7 +18,7 @@ pub fn forward(tx: mpsc::Sender<()>) {
             }
             hits += 1;
             if hits >= 3 {
-                eprintln!("[quicpipe] exiting now");
+                tracing::warn!("exiting now");
                 std::process::exit(130);
             }
             let _ = tx.try_send(());
