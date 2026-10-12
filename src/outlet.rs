@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use color_eyre::eyre::{Result, eyre};
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, Endpoint};
 use iroh::{EndpointAddr, PublicKey, SecretKey};
 use magic_wormhole::{MailboxConnection, Wormhole};
 use tokio::select;
@@ -56,10 +56,18 @@ async fn send_ctrl(tx: &mpsc::Sender<OutletToInlet>, msg: OutletToInlet) -> bool
     !matches!(timeout(CTRL_GRACE, tx.send(msg)).await, Err(_) | Ok(Err(_)))
 }
 
-pub async fn run(mut args: OutletArgs) -> Result<()> {
+pub async fn run(args: OutletArgs) -> Result<()> {
     let key = SecretKey::generate();
     let endpoint = net::bind(&key, false).await?;
+    let result = outlet_session(&endpoint, &key, args).await;
+    // Shut the transport down gracefully on every exit path so pending
+    // connection state is flushed deterministically instead of iroh aborting
+    // with "Endpoint dropped without calling Endpoint::close".
+    endpoint.close().await;
+    result
+}
 
+async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletArgs) -> Result<()> {
     if args.code.is_none() {
         args.code = Some(enter_code()?.parse()?);
     }
@@ -72,7 +80,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
     .await?;
     let mut wormhole = Wormhole::connect(mailbox).await?;
     wormhole
-        .send(wincode::serialize(&net::payload_for(&endpoint, &key))?)
+        .send(wincode::serialize(&net::payload_for(endpoint, key))?)
         .await?;
     let peer: HandshakePayload = wincode::deserialize(&wormhole.receive().await?)?;
     let peer_id = PublicKey::from_bytes(&peer.public_key)?;
@@ -95,7 +103,7 @@ pub async fn run(mut args: OutletArgs) -> Result<()> {
     let mut attempt = 0u32;
     let mut lost_attempts = 0u32;
     loop {
-        let conn = match net::dial(&endpoint, addr.clone()).await {
+        let conn = match net::dial(endpoint, addr.clone()).await {
             Ok(conn) => {
                 // A successful dial proves the inlet is reachable again; the
                 // reconnect budget starts over.
@@ -256,31 +264,10 @@ async fn session(
                 break 'session Ok(Session::Interrupted);
             }
 
-            Some(event) = events.recv() => match event {
-                SinkEvent::Ack(n) => {
-                    // try_send on purpose: a dropped ack is superseded by the
-                    // next one, and the greeting on the next connection.
-                    let _ = to_inlet_tx.try_send(OutletToInlet::Received(n));
-                }
-                SinkEvent::BrokenPipe => {
-                    // Our consumer is gone. Tell the inlet so its producer dies
-                    // too, then die like a pipe ourselves. Both frames are
-                    // awaited (bounded): this goodbye is the producer's only
-                    // SIGPIPE, so it must not be silently dropped by a wedged
-                    // writer.
-                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGPIPE).await;
-                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await;
-                    break 'session Ok(Session::BrokenPipe);
-                }
-                SinkEvent::Gap { expected, got } => {
-                    break 'session Ok(Session::Fatal(format!(
-                        "inlet started at byte {got} but we had written {expected}: \
-                         bytes are missing from the stream"
-                    )));
-                }
-                SinkEvent::Error(e) => break 'session Ok(Session::Fatal(e)),
-            },
-
+            // Peer control frames outrank sink acks: a continuously acking
+            // sink must never starve the inlet's SIGINT/EOF/Bye frames, or
+            // cancellation and the final handshake stall while the inlet's
+            // close destroys the unacked frame.
             Some(msg) = from_inlet_rx.recv() => match msg {
                 InletToOutlet::EOF => {
                     // Let the sink finish the tail. Deliberately *no* timeout:
@@ -296,8 +283,17 @@ async fn session(
 
                             Some(f) = faults_rx.recv() => break 'session Err(Lost(f)),
 
-                            Some(event) = events.recv() => match event {
-                                SinkEvent::BrokenPipe => {
+                            // Promptness over ack-forwarding: a late ack is
+                            // recoverable, a missed Ctrl-C or a dead
+                            // connection is not.
+                            _ = signals.recv() => break 'session Ok(Session::Interrupted),
+                            _ = conn.closed() => {
+                                break 'session Err(Lost(
+                                    "connection closed while draining the tail".into(),
+                                ))
+                            }
+
+                            Some(event) = events.recv() => match event {                                SinkEvent::BrokenPipe => {
                                     // The consumer exited mid-tail. What it
                                     // consumed is the true final count, and
                                     // the producer upstream must get SIGPIPE.
@@ -316,12 +312,6 @@ async fn session(
                                 _ => {}
                             },
 
-                            _ = signals.recv() => break 'session Ok(Session::Interrupted),
-                            _ = conn.closed() => {
-                                break 'session Err(Lost(
-                                    "connection closed while draining the tail".into(),
-                                ))
-                            }
                             n = sink::drain(sink, Duration::MAX) => break 'drain n,
                         }
                     };
@@ -360,6 +350,30 @@ async fn session(
                 InletToOutlet::Data { .. } => {
                     break 'session Err(Lost("data frame reached the session".into()))
                 }
+            },
+
+            Some(event) = events.recv() => match event {
+                SinkEvent::Ack(n) => {
+                    // try_send on purpose: a dropped ack is superseded by the
+                    // next one, and the greeting on the next connection.
+                    let _ = to_inlet_tx.try_send(OutletToInlet::Received(n));
+                }                SinkEvent::BrokenPipe => {
+                    // Our consumer is gone. Tell the inlet so its producer dies
+                    // too, then die like a pipe ourselves. Both frames are
+                    // awaited (bounded): this goodbye is the producer's only
+                    // SIGPIPE, so it must not be silently dropped by a wedged
+                    // writer.
+                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGPIPE).await;
+                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await;
+                    break 'session Ok(Session::BrokenPipe);
+                }
+                SinkEvent::Gap { expected, got } => {
+                    break 'session Ok(Session::Fatal(format!(
+                        "inlet started at byte {got} but we had written {expected}: \
+                         bytes are missing from the stream"
+                    )));
+                }
+                SinkEvent::Error(e) => break 'session Ok(Session::Fatal(e)),
             },
 
             Some(fault) = faults_rx.recv() => break 'session Err(Lost(fault)),

@@ -38,16 +38,24 @@ enum Session {
 struct Lost(String);
 
 pub async fn run(args: InletArgs) -> Result<()> {
-    let common = &args.common;
     let key = SecretKey::generate();
     let endpoint = net::bind(&key, true).await?;
+    let result = inlet_session(&endpoint, &key, args).await;
+    // Shut the transport down gracefully on every exit path so pending
+    // connection state is flushed deterministically instead of iroh aborting
+    // with "Endpoint dropped without calling Endpoint::close".
+    endpoint.close().await;
+    result
+}
 
+async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) -> Result<()> {
+    let common = &args.common;
     let mailbox = MailboxConnection::create(app_config(common), args.code_length).await?;
     eprintln!("Wormhole Code: {}", mailbox.code());
     tracing::info!("waiting for the other end...");
     let mut wormhole = Wormhole::connect(mailbox).await?;
     wormhole
-        .send(wincode::serialize(&net::payload_for(&endpoint, &key))?)
+        .send(wincode::serialize(&net::payload_for(endpoint, key))?)
         .await?;
     let peer: HandshakePayload = wincode::deserialize(&wormhole.receive().await?)?;
     let peer_id = PublicKey::from_bytes(&peer.public_key)?;
@@ -61,7 +69,7 @@ pub async fn run(args: InletArgs) -> Result<()> {
     let mut source_done = false;
 
     loop {
-        let Some(conn) = accept(&endpoint, peer_id, &mut signal_rx).await else {
+        let Some(conn) = accept(endpoint, peer_id, &mut signal_rx).await else {
             // Cancelled while waiting for a connection: die like a signal
             // handler should, so the exit code says 130, not 0.
             signals::die_of(libc::SIGINT);
