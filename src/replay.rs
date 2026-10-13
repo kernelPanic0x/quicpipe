@@ -228,3 +228,119 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod replay_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    // The core corruption invariant, property-tested: for any sequence of
+    // chunk sizes and any (possibly stale, possibly ahead) ack schedule,
+    // replaying from any cursor the window still holds must reproduce the
+    // exact source prefix, and replaying from anything else must be refused
+    // with the precise reason. There is no third outcome.
+    proptest! {
+        #[test]
+        fn replay_always_reconstructs_the_exact_prefix(
+            sizes in prop::collection::vec(1usize..256, 1..100),
+            acks in prop::collection::vec(0u64..100_000, 1..50),
+            cursors in prop::collection::vec(0u64..100_000, 1..50),
+        ) {
+            let mut w = Window::new(1 << 20);
+            let mut stream: Vec<u8> = Vec::new();
+            for (i, size) in sizes.into_iter().enumerate() {
+                let payload: Vec<u8> = (0..size).map(|b| (b + i) as u8).collect();
+                let (offset, _chunk) = w.push(Bytes::from(payload.clone()));
+                prop_assert_eq!(offset, stream.len() as u64);
+                stream.extend_from_slice(&payload);
+
+                // Apply one ack, possibly stale or ahead — acks must never
+                // move the base backwards or above what was sent.
+                let ack = acks[i % acks.len()];
+                let base_before = stream.len() as u64;
+                w.ack(ack);
+                prop_assert!(w.unacked() <= base_before);
+
+                // Replay from every cursor the window still holds: the result
+                // must be the exact source bytes from that cursor.
+                for &from in cursors.iter() {
+                    match w.replay_from(from) {
+                        Ok(frames) => {
+                            let mut rebuilt = Vec::new();
+                            let mut expected_off = from;
+                            for (off, ch) in &frames {
+                                prop_assert_eq!(*off, expected_off);
+                                rebuilt.extend_from_slice(ch);
+                                expected_off += ch.len() as u64;
+                            }
+                            let end = rebuilt.len() as u64 + from;
+                            let upto = end.min(stream.len() as u64);
+                            prop_assert_eq!(&stream[from as usize..upto as usize], &rebuilt[..]);
+                        }
+                        Err(OutOfRange::Gone { requested, oldest }) => {
+                            prop_assert_eq!(requested, from);
+                            prop_assert!(from < oldest);
+                        }
+                        Err(OutOfRange::Ahead { requested, sent }) => {
+                            prop_assert_eq!(requested, from);
+                            prop_assert!(from > sent);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offsets_are_sequential_and_absolute() {
+        let mut w = Window::new(1024);
+        let (o1, _) = w.push(Bytes::from_static(b"abc"));
+        let (o2, _) = w.push(Bytes::from_static(b"de"));
+        assert_eq!((o1, o2), (0, 3));
+    }
+
+    #[test]
+    fn stale_ack_never_moves_base_backwards() {
+        let mut w = Window::new(1024);
+        w.push(Bytes::from_static(b"abcdef"));
+        w.ack(6);
+        assert_eq!(w.unacked(), 0);
+        w.ack(3); // stale
+        assert_eq!(w.unacked(), 0);
+        assert!(w.replay_from(3).is_err()); // still gone
+    }
+
+    #[test]
+    fn ack_beyond_sent_is_clamped() {
+        let mut w = Window::new(1024);
+        w.push(Bytes::from_static(b"abc"));
+        w.ack(100); // ahead of what was sent
+        assert_eq!(w.unacked(), 0);
+        assert_eq!(w.head, 3);
+    }
+
+    #[test]
+    fn replay_from_mid_chunk_clips_exactly() {
+        let mut w = Window::new(1024);
+        w.push(Bytes::from_static(b"abcdef"));
+        w.push(Bytes::from_static(b"ghij"));
+        let frames = w.replay_from(2).expect("in window");
+        let mut rebuilt = Vec::new();
+        for (i, (off, ch)) in frames.iter().enumerate() {
+            assert_eq!(*off, if i == 0 { 2 } else { 6 });
+            rebuilt.extend_from_slice(ch);
+        }
+        assert_eq!(rebuilt, b"cdefghij");
+    }
+
+    #[test]
+    fn window_full_reflects_limit() {
+        let mut w = Window::new(4);
+        w.push(Bytes::from_static(b"abc"));
+        assert!(!w.is_full());
+        w.push(Bytes::from_static(b"d"));
+        assert!(w.is_full());
+        w.ack(2);
+        assert!(!w.is_full()); // unacked = 2 < 4
+    }
+}
