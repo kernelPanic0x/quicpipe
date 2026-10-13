@@ -100,8 +100,13 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
                         return Err(eyre!("outlet reported a fatal error: {r}"));
                     }
                     net::CloseKind::App(code, r) => {
-                        tracing::warn!("outlet closed the connection ({code}: {r})");
-                        return Ok(());
+                        // An unexpected application close is not a verdict we
+                        // can trust as complete. Never exit 0 here: the
+                        // upstream producer must learn the transfer failed.
+                        return Err(eyre!(
+                            "outlet closed the connection unexpectedly ({code}: {r}); \
+                             the stream is incomplete"
+                        ));
                     }
                     net::CloseKind::TimedOut | net::CloseKind::Lost(_) => {
                         tracing::warn!("connection lost: {reason}; waiting for a reconnect");

@@ -132,14 +132,15 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
         match session(&conn, &sink, &mut events_rx, &mut signal_rx).await {
             Ok(Session::Done) | Ok(Session::PeerBye) => {
                 // The sink may still be flushing the tail; let it finish so the
-                // last bytes reach the consumer.
-                finish_sink(&sink, sink_task).await;
+                // last bytes reach the consumer. A stalled sink is an error:
+                // the stream did not fully reach the consumer.
+                finish_sink(&sink, sink_task).await?;
                 return Ok(());
             }
             Ok(Session::PeerCancelled) => {
                 // The bytes received so far are a clean prefix: flush them,
                 // but the exit must stay loud — the stream did not complete.
-                finish_sink(&sink, sink_task).await;
+                let _ = finish_sink(&sink, sink_task).await;
                 return Err(eyre!(
                     "the inlet cancelled the transfer (SIGINT); \
                      the stream did not complete"
@@ -162,7 +163,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                         // The bytes received so far are a clean prefix: flush
                         // them, but the exit must stay loud — the stream did
                         // not complete.
-                        finish_sink(&sink, sink_task).await;
+                        let _ = finish_sink(&sink, sink_task).await;
                         return Err(eyre!(
                             "the inlet cancelled the transfer (SIGINT); \
                              the stream did not complete"
@@ -175,15 +176,24 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                     net::CloseKind::App(net::close::DONE, r) => {
                         // A clean close is only clean if the inlet had already
                         // said `EOF`; a `DONE` arriving without it means the
-                        // stream ended early. Distinguish loudly.
-                        tracing::warn!("inlet closed the connection: {r}");
-                        finish_sink(&sink, sink_task).await;
-                        return Ok(());
+                        // stream ended early. Data integrity outranks
+                        // everything: exit loudly with a non-zero code.
+                        let _ = finish_sink(&sink, sink_task).await;
+                        return Err(eyre!(
+                            "inlet closed with 'done' but never announced EOF: \
+                             the stream ended early ({r})"
+                        ));
                     }
                     net::CloseKind::App(_, r) => {
-                        tracing::warn!("inlet closed the connection: {r}");
-                        finish_sink(&sink, sink_task).await;
-                        return Ok(());
+                        // An unexpected application close is not a verdict we
+                        // can trust as complete. Never exit 0 here. Flush the
+                        // received prefix first: it is valid data even if the
+                        // transfer as a whole failed.
+                        let _ = finish_sink(&sink, sink_task).await;
+                        return Err(eyre!(
+                            "inlet closed the connection unexpectedly ({r}); \
+                             the stream is incomplete"
+                        ));
                     }
                     net::CloseKind::TimedOut => {
                         // Only an ordinary network failure may be retried.
@@ -219,9 +229,22 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
 
 /// Lets the sink flush the tail, then joins its thread. The sink runs on its
 /// own thread, so drain first (bounded), then join.
-async fn finish_sink(sink: &sink::Sink, sink_task: std::thread::JoinHandle<()>) {
-    sink::drain(sink, SINK_DRAIN_TIMEOUT).await;
+///
+/// Returns an error if the sink did not drain within the budget: exiting
+/// successfully with unwritten tail bytes would be silent truncation, and
+/// data integrity outranks a slow consumer.
+async fn finish_sink(
+    sink: &sink::Sink,
+    sink_task: std::thread::JoinHandle<()>,
+) -> Result<()> {
+    if sink::drain(sink, SINK_DRAIN_TIMEOUT).await.is_none() {
+        return Err(eyre!(
+            "the sink did not write its tail within {SINK_DRAIN_TIMEOUT:?}; \
+             the stream is incomplete"
+        ));
+    }
     let _ = tokio::task::spawn_blocking(move || sink_task.join()).await;
+    Ok(())
 }
 
 async fn session(
