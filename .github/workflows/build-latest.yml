@@ -161,12 +161,10 @@ jobs:
     steps:
       - name: Verify build result
         run: |
-          for job in build test; do
-            case "${{ needs[job].result }}" in
-              success|skipped) ;;
-              *) exit 1 ;;
-            esac
-          done
+          fail=0
+          [ "${{ needs.build.result }}" = "success" ] || { echo "build: ${{ needs.build.result }}"; fail=1; }
+          [ "${{ needs.test.result }}"  = "success" ] || { echo "test: ${{ needs.test.result }}"; fail=1; }
+          exit $fail
 
   publish:
     name: Update Latest Release
