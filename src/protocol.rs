@@ -7,9 +7,10 @@ use wincode::{Deserialize, SchemaRead, SchemaWrite, Serialize};
 
 pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 pub const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024; // 16 MiB max in-memory window
-/// Versioned per crate release: two builds with different wire formats can
-/// never complete a handshake, instead of misinterpreting each other's frames.
-pub const ALPN: &str = concat!("quicpipe/v", env!("CARGO_PKG_VERSION"));
+/// Manual protocol version, bumped only when the wire format changes —
+/// deliberately NOT tied to the crate version, so patch releases stay
+/// compatible and a version bump is always an explicit, reviewable decision.
+pub const ALPN: &str = "quicpipe/v1";
 
 pub trait Encoder: Sized {
     fn encode(&self) -> color_eyre::Result<Bytes>;
