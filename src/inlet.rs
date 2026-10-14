@@ -67,6 +67,7 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
 
     let mut window = Window::new(MAX_BUFFERED_BYTES as u64);
     let mut source_done = false;
+    let mut source_checksum: Option<u64> = None;
 
     loop {
         // Cancelled while waiting for a connection: die like a signal
@@ -81,6 +82,7 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
             &mut window,
             &mut source.rx,
             &mut source_done,
+            &mut source_checksum,
             &mut signal_rx,
         )
         .await
@@ -201,6 +203,7 @@ async fn session(
     window: &mut Window,
     source: &mut mpsc::Receiver<source::Msg>,
     source_done: &mut bool,
+    source_checksum: &mut Option<u64>,
     signals: &mut mpsc::Receiver<i32>,
 ) -> Result<Session, Lost> {
     let (send, recv) = conn.accept_bi().await.map_err(|e| Lost(e.to_string()))?;
@@ -260,10 +263,13 @@ async fn session(
         // Top-of-loop, so it fires even when the final ack arrived in the same
         // iteration as the last data frame.
         if *source_done && !eof_queued && backlog.is_empty() {
-            // EOF goes first and alone: everything the source produced is now
-            // either buffered for replay or already sent, so the true end of
-            // the stream is this exact frame — however many connections it
-            // takes to deliver it.
+            // The checksum goes first so the outlet has the verdict in hand
+            // when EOF arrives, and EOF goes first and alone: everything the
+            // source produced is now either buffered for replay or already
+            // sent, so the true end of the stream is this exact frame —
+            // however many connections it takes to deliver it.
+            let checksum = source_checksum.expect("source_done implies a checksum");
+            let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Checksum(checksum))).await;
             let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::EOF)).await;
             eof_queued = true;
         }
@@ -316,8 +322,9 @@ async fn session(
                     let (offset, payload) = window.push(chunk);
                     let _ = to_outlet_tx.try_send(InletToOutlet::Data { offset, payload });
                 }
-                Some(source::Msg::Eof) => {
+                Some(source::Msg::Eof { checksum }) => {
                     *source_done = true;
+                    *source_checksum = Some(checksum);
                 }
                 Some(source::Msg::Error(e)) => {
                     let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Fatal(e.clone()))).await;

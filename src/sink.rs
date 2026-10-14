@@ -24,10 +24,11 @@ pub enum Msg {
         offset: u64,
         payload: Bytes,
     },
-    /// Drain barrier: resolves with the cursor once everything queued before it
-    /// has been written. Used at end-of-stream so the final `Received` we send
-    /// is the true total.
-    Barrier(tokio::sync::oneshot::Sender<u64>),
+    /// Drain barrier: resolves with (cursor, digest) once everything queued
+    /// before it has been written. Used at end-of-stream so the final
+    /// `Received` we send is the true total and the checksum verdict is
+    /// computed over exactly the bytes on the wire.
+    Barrier(tokio::sync::oneshot::Sender<(u64, u64)>),
     Eof,
 }
 
@@ -73,8 +74,9 @@ impl Sink {
     }
 }
 
-/// Waits for everything already queued to be written, and reports the cursor.
-pub async fn drain(sink: &Sink, within: std::time::Duration) -> Option<u64> {
+/// Waits for everything already queued to be written, and reports the cursor
+/// and the XXH3-64 digest of every byte written so far.
+pub async fn drain(sink: &Sink, within: std::time::Duration) -> Option<(u64, u64)> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let barrier = async {
         sink.tx.send(Msg::Barrier(tx)).await.ok()?;
@@ -93,6 +95,10 @@ fn writer(
     events: mpsc::Sender<Event>,
 ) {
     use std::io::Write as _; // trait scope for clio::Output/stdout flush
+
+    // Hashes exactly the bytes handed to the OS, in write order: the verdict
+    // the checksum is compared against.
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
 
     let to_stdout = path.as_os_str() == "-";
     let mut out = match clio::Output::new(&path) {
@@ -136,13 +142,17 @@ fn writer(
                 // "durably stored", and the doc says so.
                 let total = done + fresh.len() as u64;
                 cursor.store(total, std::sync::atomic::Ordering::SeqCst);
+                hasher.update(&fresh);
                 if total > acked {
                     acked = total;
                     let _ = events.blocking_send(Event::Ack(total));
                 }
             }
             Msg::Barrier(reply) => {
-                let _ = reply.send(cursor.load(std::sync::atomic::Ordering::SeqCst));
+                let _ = reply.send((
+                    cursor.load(std::sync::atomic::Ordering::SeqCst),
+                    hasher.digest(),
+                ));
             }
             Msg::Eof => {
                 let _ = out.flush();
@@ -208,7 +218,7 @@ mod sink_tests {
     /// then returns (file bytes, final cursor if the writer was still alive,
     /// observed events). The drain happens before any terminal event so the
     /// cursor reflects exactly the frames sent so far.
-    async fn run(frames: Vec<Msg>, terminate: bool) -> (Vec<u8>, Option<u64>, Vec<Event>) {
+    async fn run(frames: Vec<Msg>, terminate: bool) -> (Vec<u8>, Option<(u64, u64)>, Vec<Event>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("out.bin");
         let (events_tx, mut events_rx) = mpsc::channel::<Event>(1024);
@@ -255,7 +265,7 @@ mod sink_tests {
         )
         .await;
         assert_eq!(bytes, b"hello world");
-        assert_eq!(cursor, Some(11));
+        assert_eq!(cursor, Some((11, xxhash_rust::xxh3::xxh3_64(b"hello world"))));
         assert!(events.iter().all(|e| matches!(e, Event::Ack(_))));
     }
 
@@ -275,7 +285,7 @@ mod sink_tests {
         )
         .await;
         assert_eq!(bytes, b"abcdefgh");
-        assert_eq!(cursor, Some(8));
+        assert_eq!(cursor, Some((8, xxhash_rust::xxh3::xxh3_64(b"abcdefgh"))));
     }
 
     #[tokio::test]
@@ -301,7 +311,7 @@ mod sink_tests {
         let big = vec![0xABu8; CHUNK_SIZE * 2];
         let (bytes, cursor, _) = run(vec![data(0, &big)], true).await;
         assert_eq!(bytes.len(), big.len());
-        assert_eq!(cursor, Some(big.len() as u64));
+        assert_eq!(cursor, Some((big.len() as u64, xxhash_rust::xxh3::xxh3_64(&big))));
         assert!(bytes.iter().all(|&b| b == 0xAB));
     }
 
@@ -311,6 +321,6 @@ mod sink_tests {
         // sees the data; verify by reading after the writer thread exits.
         let (bytes, cursor, _) = run(vec![data(0, b"tail")], true).await;
         assert_eq!(bytes, b"tail");
-        assert_eq!(cursor, Some(4));
+        assert_eq!(cursor, Some((4, xxhash_rust::xxh3::xxh3_64(b"tail"))));
     }
 }

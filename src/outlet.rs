@@ -275,6 +275,7 @@ async fn session(
     let (to_inlet_tx, to_inlet_rx) = mpsc::channel::<OutletToInlet>(4);
     let (from_inlet_tx, mut from_inlet_rx) = mpsc::channel::<InletToOutlet>(4);
     let (faults_tx, mut faults_rx) = mpsc::channel::<String>(2);
+    let mut announced_checksum: Option<u64> = None;
 
     sink::pump(recv, sink.tx.clone(), from_inlet_tx, faults_tx.clone());
     let writer = link::write_half(send, to_inlet_rx, faults_tx.clone());
@@ -360,10 +361,10 @@ async fn session(
                                 SinkEvent::Gap { .. } => {}
                             },
 
-                            n = sink::drain(sink, Duration::MAX) => break 'drain n,
+                            verdict = sink::drain(sink, Duration::MAX) => break 'drain verdict,
                         }
                     };
-                    let Some(tail_end) = final_offset else {
+                    let Some((tail_end, written_digest)) = final_offset else {
                         break 'session Ok(Session::Fatal(
                             "sink stopped before the tail was written".into(),
                         ));
@@ -381,10 +382,29 @@ async fn session(
                         break 'session Err(Lost("could not deliver the goodbye".into()));
                     }
 
-                    // All data is written; `finish_sink` now sends the sink's
-                    // own EOF (flush + close) after its drain barrier, so the
-                    // writer thread is still alive to answer it.
+                    // The integrity verdict: what the inlet's source produced
+                    // must equal what we handed to the OS. A mismatch means a
+                    // protocol bug corrupted the stream — never exit 0.
+                    let Some(expected) = announced_checksum else {
+                        break 'session Ok(Session::Fatal(
+                            "the inlet sent EOF without a checksum".into(),
+                        ));
+                    };
+                    if expected != written_digest {
+                        break 'session Ok(Session::Fatal(format!(
+                            "checksum mismatch: the inlet sent {expected:#018x}, \
+                             we wrote {written_digest:#018x}: the stream is corrupt"
+                        )));
+                    }
+
+                    // All data is written and verified; `finish_sink` now
+                    // sends the sink's own EOF (flush + close) after its drain
+                    // barrier, so the writer thread is still alive to answer it.
                     break 'session Ok(Session::Done);
+                }
+                InletToOutlet::Checksum(sum) => {
+                    // Arrives before EOF; the verdict is enforced there.
+                    announced_checksum = Some(sum);
                 }
                 InletToOutlet::SIGINT => break 'session Ok(Session::PeerCancelled),
                 InletToOutlet::Fatal(report) => break 'session Ok(Session::Fatal(report)),

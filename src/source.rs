@@ -19,7 +19,9 @@ use crate::protocol::CHUNK_SIZE;
 #[derive(Debug)]
 pub enum Msg {
     Data(Bytes),
-    Eof,
+    /// End of the source. Carries the XXH3-64 digest of every byte produced,
+    /// so the outlet can verify what it wrote against what was read.
+    Eof { checksum: u64 },
     Error(String),
 }
 
@@ -46,6 +48,8 @@ pub fn spawn(path: &Path, capacity: usize) -> std::io::Result<Source> {
                 }
             };
 
+            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+
             // One copy per chunk: the kernel fills `buf`, we copy the read
             // prefix into an owned `Bytes` so it can outlive the buffer.
             // (True zero-copy via `Read::read_buf` is still unstable, and the
@@ -55,10 +59,13 @@ pub fn spawn(path: &Path, capacity: usize) -> std::io::Result<Source> {
             loop {
                 match input.read(&mut buf) {
                     Ok(0) => {
-                        let _ = tx.blocking_send(Msg::Eof);
+                        let _ = tx.blocking_send(Msg::Eof {
+                            checksum: hasher.digest(),
+                        });
                         return;
                     }
                     Ok(n) => {
+                        hasher.update(buf.get(..n).expect("read reported n bytes"));
                         let chunk = Bytes::copy_from_slice(buf.get(..n).expect("read reported n bytes"));
                         // This is where backpressure lands: when the replay
                         // window is full the channel fills, this parks, and the
@@ -95,14 +102,23 @@ mod source_tests {
 
         let mut source = spawn(&path, 4).expect("spawn");
         let mut received = Vec::new();
+        let mut checksum = None;
         while let Some(msg) = source.rx.recv().await {
             match msg {
                 Msg::Data(chunk) => received.extend_from_slice(&chunk),
-                Msg::Eof => break,
+                Msg::Eof { checksum: sum } => {
+                    checksum = Some(sum);
+                    break;
+                }
                 Msg::Error(e) => panic!("source errored: {e}"),
             }
         }
         assert_eq!(received, payload);
+        assert_eq!(
+            checksum,
+            Some(xxhash_rust::xxh3::xxh3_64(&payload)),
+            "the checksum must be the digest of the exact bytes produced"
+        );
     }
 
     #[tokio::test]

@@ -93,6 +93,12 @@ pub enum InletToOutlet {
         payload: Bytes,
     },
     EOF,
+    /// End-to-end integrity verdict: the XXH3-64 digest of everything the
+    /// inlet's source produced, sent just before EOF. The outlet compares it
+    /// against the hash of the bytes it actually wrote; any mismatch — a
+    /// skipped or duplicated chunk, a bad resume, anything the framing alone
+    /// could not see — fails the transfer loudly.
+    Checksum(u64),
     /// Ctrl+C
     SIGINT,
     /// Unrecoverable: a source read failure, a protocol violation, or a resume
