@@ -243,6 +243,11 @@ async fn finish_sink(
              the stream is incomplete"
         ));
     }
+    // The drain barrier is answered, so the writer thread is alive: now it
+    // takes the EOF, which flushes and closes the fd for downstream readers.
+    if timeout(CTRL_GRACE, sink.tx.send(sink::Msg::Eof)).await.is_err() {
+        return Err(eyre!("the sink did not accept EOF"));
+    }
     let _ = tokio::task::spawn_blocking(move || sink_task.join()).await;
     Ok(())
 }
@@ -359,12 +364,9 @@ async fn session(
                         break 'session Err(Lost("could not deliver the goodbye".into()));
                     }
 
-                    // All data is written, so the sink takes EOF immediately.
-                    // If it somehow cannot, fail loudly instead of parking the
-                    // final `join` in `run` forever.
-                    if timeout(CTRL_GRACE, sink.tx.send(sink::Msg::Eof)).await.is_err() {
-                        break 'session Ok(Session::Fatal("sink did not accept EOF".into()));
-                    }
+                    // All data is written; `finish_sink` now sends the sink's
+                    // own EOF (flush + close) after its drain barrier, so the
+                    // writer thread is still alive to answer it.
                     break 'session Ok(Session::Done);
                 }
                 InletToOutlet::SIGINT => break 'session Ok(Session::PeerCancelled),
