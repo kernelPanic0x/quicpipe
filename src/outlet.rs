@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::completer::enter_code;
-use crate::protocol::*;
+use crate::protocol::{OutletToInlet, HandshakePayload, InletToOutlet};
 use crate::sink::{self, Event as SinkEvent, Sink};
 use crate::{OutletArgs, app_config, link, net, signals};
 
@@ -71,10 +71,11 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
     if args.code.is_none() {
         args.code = Some(enter_code()?.parse()?);
     }
+    let code = args.code.take();
 
     let mailbox = MailboxConnection::connect(
         app_config(&args.common),
-        args.code.expect("Code set").clone(),
+        code.expect("Code set"),
         false,
     )
     .await?;
@@ -131,7 +132,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
 
         let progress_before = sink.cursor();
         match session(&conn, &sink, &mut events_rx, &mut signal_rx).await {
-            Ok(Session::Done) | Ok(Session::PeerBye) => {
+            Ok(Session::Done | Session::PeerBye) => {
                 // The sink may still be flushing the tail; let it finish so the
                 // last bytes reach the consumer. A stalled sink is an error:
                 // the stream did not fully reach the consumer.
@@ -294,12 +295,12 @@ async fn session(
 
             // Local first, so Ctrl-C and a broken downstream are reported
             // promptly even while the stream is saturated.
-            sig = signals.recv() => {
+            received_sig = signals.recv() => {
                 // The producer's Ctrl-C must reach the inlet: the source dies
                 // of SIGINT, so this goodbye is its only way to learn. Awaited
                 // (bounded) so it cannot be silently dropped by a wedged
                 // writer.
-                let sig = sig.unwrap_or(libc::SIGINT);
+                let sig = received_sig.unwrap_or(libc::SIGINT);
                 let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGINT).await;
                 break 'session Ok(Session::Interrupted(sig));
             }
@@ -326,9 +327,9 @@ async fn session(
                             // Promptness over ack-forwarding: a late ack is
                             // recoverable, a missed Ctrl-C or a dead
                             // connection is not.
-                            sig = signals.recv() => {
+                            received_sig = signals.recv() => {
                                 break 'session Ok(Session::Interrupted(
-                                    sig.unwrap_or(libc::SIGINT),
+                                    received_sig.unwrap_or(libc::SIGINT),
                                 ))
                             }
                             _ = conn.closed() => {
@@ -354,19 +355,18 @@ async fn session(
                                     // greeting of a reconnect stays truthful.
                                     let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Received(n)).await;
                                 }
-                                _ => {}
+                                // Impossible mid-tail: the inlet replays from
+                                // our cursor, so it can never start beyond it.
+                                SinkEvent::Gap { .. } => {}
                             },
 
                             n = sink::drain(sink, Duration::MAX) => break 'drain n,
                         }
                     };
-                    let final_offset = match final_offset {
-                        Some(n) => n,
-                        None => {
-                            break 'session Ok(Session::Fatal(
-                                "sink stopped before the tail was written".into(),
-                            ))
-                        }
+                    let Some(tail_end) = final_offset else {
+                        break 'session Ok(Session::Fatal(
+                            "sink stopped before the tail was written".into(),
+                        ));
                     };
 
                     // The goodbye is the inlet's only way to reach `Done`, so
@@ -374,7 +374,7 @@ async fn session(
                     // failure breaks `Lost` instead of ending the session
                     // silently. On reconnect the greeting restates the same
                     // cursor, so the handshake converges.
-                    if !send_ctrl(&to_inlet_tx, OutletToInlet::Received(final_offset)).await {
+                    if !send_ctrl(&to_inlet_tx, OutletToInlet::Received(tail_end)).await {
                         break 'session Err(Lost("could not deliver the final ack".into()));
                     }
                     if !send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await {
@@ -387,7 +387,7 @@ async fn session(
                     break 'session Ok(Session::Done);
                 }
                 InletToOutlet::SIGINT => break 'session Ok(Session::PeerCancelled),
-                InletToOutlet::Fatal(msg) => break 'session Ok(Session::Fatal(msg)),
+                InletToOutlet::Fatal(report) => break 'session Ok(Session::Fatal(report)),
                 InletToOutlet::Bye => break 'session Ok(Session::PeerBye),
                 InletToOutlet::Data { .. } => {
                     break 'session Err(Lost("data frame reached the session".into()))

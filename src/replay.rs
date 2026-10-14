@@ -122,7 +122,7 @@ impl Window {
                 if from <= *offset {
                     Some((*offset, chunk.clone()))
                 } else if from < end {
-                    Some((from, chunk.slice((from - offset) as usize..)))
+                    Some((from, chunk.slice(usize::try_from(from - offset).expect("within chunk")..)))
                 } else {
                     None
                 }
@@ -133,6 +133,13 @@ impl Window {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::pedantic,
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation
+    )]
+
     use super::*;
 
     fn window(chunks: &[&'static [u8]]) -> Window {
@@ -153,7 +160,7 @@ mod tests {
                 (8, Bytes::from_static(b"cccc")),
             ]
         );
-        assert!(w.replay_from(12).unwrap().is_empty());
+        assert_eq!(w.replay_from(12).unwrap(), [] as [(u64, bytes::Bytes); 0]);
     }
 
     #[test]
@@ -231,6 +238,14 @@ mod tests {
 
 #[cfg(test)]
 mod replay_properties {
+    #![allow(
+        clippy::pedantic,
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::shadow_reuse
+    )]
+
     use super::*;
     use proptest::prelude::*;
 
@@ -263,7 +278,7 @@ mod replay_properties {
 
                 // Replay from every cursor the window still holds: the result
                 // must be the exact source bytes from that cursor.
-                for &from in cursors.iter() {
+                for &from in &cursors {
                     match w.replay_from(from) {
                         Ok(frames) => {
                             let mut rebuilt = Vec::new();

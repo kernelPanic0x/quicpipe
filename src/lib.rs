@@ -77,7 +77,7 @@ struct CommonArgs {
     #[arg(long, value_name = "ws://example.org", value_hint = clap::ValueHint::Url, env = "WORMHOLE_MAILBOX_URL")]
     rendezvous_server: Option<url::Url>,
 
-    /// Silence status output (errors only). RUST_LOG overrides this.
+    /// Silence status output (errors only). `RUST_LOG` overrides this.
     #[arg(long, short)]
     pub quiet: bool,}
 
@@ -117,13 +117,13 @@ async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<i32> {
     };
 
     match cli.cmd {
-        Cmd::Inlet(args) => {
-            init_logging(args.common.quiet);
-            inlet::run(args).await?
+        Cmd::Inlet(inlet_args) => {
+            init_logging(inlet_args.common.quiet);
+            inlet::run(inlet_args).await?;
         }
-        Cmd::Outlet(args) => {
-            init_logging(args.common.quiet);
-            outlet::run(args).await?
+        Cmd::Outlet(outlet_args) => {
+            init_logging(outlet_args.common.quiet);
+            outlet::run(outlet_args).await?;
         }
         Cmd::GenKey => gen_secret_key(),
         Cmd::GenPub => gen_public_key()?,
@@ -132,7 +132,7 @@ async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<i32> {
     Ok(0)
 }
 
-pub async fn run_from<I, S>(args: I) -> i32
+pub async fn run_from<I, S>(raw_args: I) -> i32
 where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
@@ -141,7 +141,7 @@ where
 
     let argv: Vec<std::ffi::OsString> =
         std::iter::once(std::ffi::OsString::from(env!("CARGO_PKG_NAME")))
-            .chain(args.into_iter().map(Into::into))
+            .chain(raw_args.into_iter().map(Into::into))
             .collect();
 
     match async_main(argv).await {

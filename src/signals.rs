@@ -28,7 +28,7 @@ pub fn forward(tx: mpsc::Sender<i32>) {
 
 /// Dies of `sig`, so that a pipeline behaves like a pipeline.
 ///
-/// Restoring SIG_DFL matters: Rust installs SIG_IGN for SIGPIPE at startup, so
+/// Restoring `SIG_DFL` matters: Rust installs `SIG_IGN` for SIGPIPE at startup, so
 /// `raise` alone would be a no-op and the producer upstream would never die.
 pub fn die_of(sig: i32) -> ! {
     unsafe {

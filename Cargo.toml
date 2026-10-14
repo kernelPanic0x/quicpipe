@@ -7,6 +7,29 @@ edition = "2024"
 # dependency versions in sync with rescue-shell's [workspace.dependencies]
 # so both share one version per crate via the workspace lockfile.
 
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+too_many_lines = "allow"
+
+# 1. Eliminate unhandled panics and debugging leftovers
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+panic = "warn"
+panic_in_result_fn = "warn"
+
+# 2. Performance & Memory Smells
+clone_on_ref_ptr = "warn"
+redundant_clone = "warn"
+rc_buffer = "warn"
+needless_pass_by_value = "warn"
+
+# 3. Defensive Programming & Safety
+indexing_slicing = "warn"
+float_cmp = "warn"
+shadow_reuse = "warn"
+
 [profile.release]
 opt-level = "z"
 lto = true

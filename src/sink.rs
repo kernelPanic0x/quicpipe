@@ -59,11 +59,11 @@ impl Sink {
     ) -> std::io::Result<(Sink, thread::JoinHandle<()>)> {
         let (tx, rx) = mpsc::channel(capacity);
         let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let path = path.to_owned();
-        let cursor = written.clone();
+        let owned_path = path.to_owned();
+        let cursor = std::sync::Arc::clone(&written);
         let join = thread::Builder::new()
             .name("quicpipe-sink".into())
-            .spawn(move || writer(path, rx, cursor, events))?;
+            .spawn(move || writer(owned_path, rx, cursor, events))?;
         Ok((Sink { tx, written }, join))
     }
 
@@ -83,6 +83,9 @@ pub async fn drain(sink: &Sink, within: std::time::Duration) -> Option<u64> {
     tokio::time::timeout(within, barrier).await.ok().flatten()
 }
 
+// A thread-entry function must own its arguments ('static closure), even the
+// ones it only reads.
+#[allow(clippy::needless_pass_by_value)]
 fn writer(
     path: std::path::PathBuf,
     mut rx: mpsc::Receiver<Msg>,
@@ -102,9 +105,8 @@ fn writer(
 
     let mut acked: u64 = 0;
     loop {
-        let msg = match rx.blocking_recv() {
-            Some(msg) => msg,
-            None => return,
+        let Some(msg) = rx.blocking_recv() else {
+            return;
         };
         match msg {
             Msg::Data { offset, payload } => {
@@ -119,7 +121,7 @@ fn writer(
                     });
                     return;
                 } else {
-                    payload.slice((done - offset) as usize..)
+                    payload.slice(usize::try_from(done - offset).expect("within the chunk")..)
                 };
 
                 if let Err(e) = out.write_all(&fresh) {
@@ -188,6 +190,13 @@ pub fn pump(
 
 #[cfg(test)]
 mod sink_tests {
+    #![allow(
+        clippy::pedantic,
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation
+    )]
+
     use super::*;
     use crate::protocol::CHUNK_SIZE;
 

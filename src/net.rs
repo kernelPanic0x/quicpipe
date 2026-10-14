@@ -18,11 +18,11 @@ use crate::protocol::{ALPN, HandshakePayload};
 /// task failed before the connection itself reported anything.
 pub const CLOSE_REVEAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How long to linger after an intentional `close` so the CONNECTION_CLOSE
+/// How long to linger after an intentional `close` so the `CONNECTION_CLOSE`
 /// frame reaches the peer before the endpoint (or the whole process) goes away.
 pub const CLOSE_PROPAGATE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Application close codes carried in the QUIC CONNECTION_CLOSE frame.
+/// Application close codes carried in the QUIC `CONNECTION_CLOSE` frame.
 ///
 /// These are the authoritative cancellation signal: in-band control frames
 /// (`SIGINT`, `Bye`, `Fatal`) can be lost together with the stream, but the
@@ -53,8 +53,8 @@ pub enum CloseKind {
 /// Closes the connection immediately with an application close code, announcing
 /// an intentional exit at the transport level.
 pub fn close_intentional(conn: &Connection, code: u64, reason: &str) {
-    if let Ok(code) = VarInt::from_u64(code) {
-        conn.close(code, reason.as_bytes());
+    if let Ok(varint) = VarInt::from_u64(code) {
+        conn.close(varint, reason.as_bytes());
     }
 }
 
@@ -128,8 +128,8 @@ pub fn payload_for(endpoint: &Endpoint, key: &SecretKey) -> HandshakePayload {
         public_key: *key.public().as_bytes(),
         // The relay URL survives NAT rebinds and interface changes; the direct
         // addresses are only a shortcut and will go stale.
-        relay_url: addr.relay_urls().next().map(|url| url.to_string()),
-        direct_addresses: addr.ip_addrs().cloned().collect::<Vec<SocketAddr>>(),
+        relay_url: addr.relay_urls().next().map(std::string::ToString::to_string),
+        direct_addresses: addr.ip_addrs().copied().collect::<Vec<SocketAddr>>(),
     }
 }
 
@@ -154,7 +154,7 @@ pub async fn wait_for_retry(
     signals: &mut mpsc::Receiver<i32>,
 ) -> Option<i32> {
     tokio::select! {
-        _ = tokio::time::sleep(delay) => None,
+        () = tokio::time::sleep(delay) => None,
         sig = signals.recv() => Some(sig.unwrap_or(libc::SIGINT)),
     }
 }
@@ -168,8 +168,7 @@ pub fn backoff(attempt: u32) -> std::time::Duration {
     let base = 200u64.saturating_mul(1 << attempt.min(6)).min(5_000);
     let jitter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::from(d.subsec_millis()))
         % (base / 2 + 1);
     std::time::Duration::from_millis(base / 2 + jitter)
 }

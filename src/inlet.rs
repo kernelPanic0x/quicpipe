@@ -12,7 +12,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
-use crate::protocol::*;
+use crate::protocol::{HandshakePayload, MAX_BUFFERED_BYTES, InletToOutlet, OutletToInlet};
 use crate::replay::Window;
 use crate::{InletArgs, app_config, link, net, signals, source};
 
@@ -85,7 +85,7 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
         )
         .await
         {
-            Ok(Session::Done) | Ok(Session::PeerBye) => return Ok(()),
+            Ok(Session::Done | Session::PeerBye) => return Ok(()),
             Ok(Session::Interrupted(sig)) => signals::die_of(sig),
             Ok(Session::SigPipe) => signals::die_of(libc::SIGPIPE),
             Ok(Session::Fatal(msg)) => return Err(eyre!(msg)),
@@ -131,11 +131,18 @@ async fn queue_ctrl(tx: &mpsc::Sender<InletToOutlet>, msg: InletToOutlet) {
     let deadline = tokio::time::Instant::now() + CTRL_GRACE;
     loop {
         match tx.try_send(msg.clone()) {
-            Ok(()) => return,
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(20)).await
+            // Success and a torn-down session both end the queueing loop;
+            // the close code takes over.
+            Ok(())
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+            // The writer drains the channel continuously, so Full is a brief
+            // congestion.
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            Err(_) => return, // session torn down; the close code takes over
         }
     }
 }
@@ -156,7 +163,7 @@ async fn accept(
                 // A closed endpoint is an infrastructure failure, not a user
                 // cancellation: report it, never disguise it as SIGINT.
                 match incoming {
-                    Some(incoming) => incoming,
+                    Some(next) => next,
                     None => {
                         return Err(eyre!("the endpoint stopped accepting connections"));
                     }
@@ -294,7 +301,7 @@ async fn session(
                 OutletToInlet::SIGPIPE => break 'session Ok(Session::SigPipe),
             },
 
-            _ = std::future::ready(()), if can_replay => {
+            () = std::future::ready(()), if can_replay => {
                 if let Some((offset, payload)) = backlog.pop_front() {
                     let _ = to_outlet_tx.try_send(InletToOutlet::Data { offset, payload });
                 }
