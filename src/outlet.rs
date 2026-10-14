@@ -101,6 +101,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
     let (signal_tx, mut signal_rx) = mpsc::channel::<i32>(1);
     signals::forward(signal_tx);
 
+    let mut announced_checksum: Option<u64> = None;
     let mut attempt = 0u32;
     let mut lost_attempts = 0u32;
     loop {
@@ -131,7 +132,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
         };
 
         let progress_before = sink.cursor();
-        match session(&conn, &sink, &mut events_rx, &mut signal_rx).await {
+        match session(&conn, &sink, &mut events_rx, &mut announced_checksum, &mut signal_rx).await {
             Ok(Session::Done | Session::PeerBye) => {
                 // The sink may still be flushing the tail; let it finish so the
                 // last bytes reach the consumer. A stalled sink is an error:
@@ -268,6 +269,7 @@ async fn session(
     conn: &Connection,
     sink: &Sink,
     events: &mut mpsc::Receiver<SinkEvent>,
+    announced_checksum: &mut Option<u64>,
     signals: &mut mpsc::Receiver<i32>,
 ) -> Result<Session, Lost> {
     let (send, recv) = conn.open_bi().await.map_err(|e| Lost(e.to_string()))?;
@@ -275,7 +277,6 @@ async fn session(
     let (to_inlet_tx, to_inlet_rx) = mpsc::channel::<OutletToInlet>(4);
     let (from_inlet_tx, mut from_inlet_rx) = mpsc::channel::<InletToOutlet>(4);
     let (faults_tx, mut faults_rx) = mpsc::channel::<String>(2);
-    let mut announced_checksum: Option<u64> = None;
 
     sink::pump(recv, sink.tx.clone(), from_inlet_tx, faults_tx.clone());
     let writer = link::write_half(send, to_inlet_rx, faults_tx.clone());
@@ -385,7 +386,7 @@ async fn session(
                     // The integrity verdict: what the inlet's source produced
                     // must equal what we handed to the OS. A mismatch means a
                     // protocol bug corrupted the stream — never exit 0.
-                    let Some(expected) = announced_checksum else {
+                    let Some(expected) = *announced_checksum else {
                         break 'session Ok(Session::Fatal(
                             "the inlet sent EOF without a checksum".into(),
                         ));
@@ -404,7 +405,7 @@ async fn session(
                 }
                 InletToOutlet::Checksum(sum) => {
                     // Arrives before EOF; the verdict is enforced there.
-                    announced_checksum = Some(sum);
+                    *announced_checksum = Some(sum);
                 }
                 InletToOutlet::SIGINT => break 'session Ok(Session::PeerCancelled),
                 InletToOutlet::Fatal(report) => break 'session Ok(Session::Fatal(report)),
