@@ -52,14 +52,15 @@ pub fn spawn(path: &Path, capacity: usize) -> std::io::Result<Source> {
             let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
             loop {
                 buf.reserve(CHUNK_SIZE);
-                // SAFETY: `chunk_mut` hands out uninitialized spare capacity.
                 // SAFETY: `chunk_mut` hands out the uninitialized spare
                 // capacity as a raw pointer. The read below initializes
                 // exactly its first `n` bytes (a successful read(2) always
-                // fills what it reports), and `split_to(n)` promotes exactly
-                // those bytes into `Bytes`; the uninitialized tail remains
-                // outside every live view. This is the pattern the bytes
-                // crate documents for zero-copy IO into a `BytesMut`.
+                // fills what it reports); `advance_mut(n)` then marks those
+                // bytes as the buffer's live contents, and `split_to(n)`
+                // detaches exactly them into a `Bytes`. The uninitialized
+                // tail remains outside every live view. This is the pattern
+                // the bytes crate documents for zero-copy IO into a
+                // `BytesMut` — the advance is what makes the read visible.
                 let read = {
                     let chunk = buf.chunk_mut();
                     let spare =
@@ -72,6 +73,7 @@ pub fn spawn(path: &Path, capacity: usize) -> std::io::Result<Source> {
                         return;
                     }
                     Ok(n) => {
+                        unsafe { buf.advance_mut(n) };
                         let chunk = buf.split_to(n).freeze();
                         // This is where backpressure lands: when the replay
                         // window is full the channel fills, this parks, and the
@@ -91,4 +93,41 @@ pub fn spawn(path: &Path, capacity: usize) -> std::io::Result<Source> {
         })?;
 
     Ok(Source { rx })
+}
+
+#[cfg(test)]
+mod source_tests {
+    #![allow(clippy::unwrap_used, clippy::pedantic, clippy::panic)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reads_a_file_completely_and_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("in.bin");
+        let payload: Vec<u8> = (0..(CHUNK_SIZE * 2 + 1234)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &payload).expect("write");
+
+        let mut source = spawn(&path, 4).expect("spawn");
+        let mut received = Vec::new();
+        while let Some(msg) = source.rx.recv().await {
+            match msg {
+                Msg::Data(chunk) => received.extend_from_slice(&chunk),
+                Msg::Eof => break,
+                Msg::Error(e) => panic!("source errored: {e}"),
+            }
+        }
+        assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_is_an_error_not_silence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist");
+        let mut source = spawn(&path, 4).expect("spawn");
+        match source.rx.recv().await {
+            Some(Msg::Error(_)) => {}
+            other => panic!("expected an Error, got {other:?}"),
+        }
+    }
 }
