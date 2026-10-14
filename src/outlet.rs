@@ -23,11 +23,6 @@ const SINK_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// is the connection closed as a backstop.
 const PEER_CLOSE_GRACE: Duration = Duration::from_secs(3);
 
-/// How many consecutive reconnects the outlet tolerates after a lost
-/// connection before concluding the inlet is gone for good. An idle timeout on
-/// a live network recovers well within this; a hard-killed inlet never will.
-const MAX_RECONNECTS: u32 = 10;
-
 /// How long a control-frame send may wait for the writer to take it before we
 /// treat the connection as wedged. `mpsc::Sender::send` is cancel-safe, so a
 /// timed-out send is *guaranteed* not to have delivered the frame: no silent
@@ -116,11 +111,6 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
             Err(e) if net::transient(&e) => {
                 attempt += 1;
                 lost_attempts += 1;
-                if lost_attempts > MAX_RECONNECTS {
-                    return Err(eyre!(
-                        "cannot reach the inlet after {MAX_RECONNECTS} attempts: {e}"
-                    ));
-                }
                 tracing::warn!("connect failed: {e}; retrying");
                 if let Some(sig) = net::wait_for_retry(net::backoff(attempt), &mut signal_rx).await {
                     // Cancelled while retrying: exit like a signal handler.
@@ -131,7 +121,6 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
             Err(e) => return Err(e),
         };
 
-        let progress_before = sink.cursor();
         match session(&conn, &sink, &mut events_rx, &mut announced_checksum, &mut signal_rx).await {
             Ok(Session::Done | Session::PeerBye) => {
                 // The sink may still be flushing the tail; let it finish so the
@@ -156,12 +145,6 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                 return Err(color_eyre::eyre::eyre!(msg));
             }
             Err(Lost(reason)) => {
-                // The reconnect budget renews only on actual progress: data
-                // that reached the consumer since the last attempt. A peer
-                // that accepts dials but never delivers stays bounded.
-                if sink.cursor() > progress_before {
-                    lost_attempts = 0;
-                }
                 lost_attempts += 1;
                 // First ask the connection why it ended. An application close
                 // means the inlet made a final decision and must not be
@@ -206,12 +189,6 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                     }
                     net::CloseKind::TimedOut => {
                         // Only an ordinary network failure may be retried.
-                        if lost_attempts > MAX_RECONNECTS {
-                            return Err(eyre!(
-                                "connection lost {MAX_RECONNECTS} times without the \
-                                 inlet coming back; giving up (timed out)"
-                            ));
-                        }
                         tracing::warn!("connection lost: {reason}; reconnecting");
                         if let Some(sig) =
                             net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
@@ -221,13 +198,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                     }
                     net::CloseKind::Lost(why) => {
                         // Only an ordinary network failure may be retried.
-                        if lost_attempts > MAX_RECONNECTS {
-                            return Err(eyre!(
-                                "connection lost {MAX_RECONNECTS} times without the \
-                                 inlet coming back; giving up ({why})"
-                            ));
-                        }
-                        tracing::warn!("connection lost: {reason}; reconnecting");
+                        tracing::warn!("connection lost: {reason}; reconnecting (transport: {why})");
                         if let Some(sig) =
                             net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
                         {
