@@ -6,22 +6,22 @@
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-pub fn forward(tx: mpsc::Sender<()>) {
+pub fn forward(tx: mpsc::Sender<i32>) {
     tokio::spawn(async move {
         let mut int = signal(SignalKind::interrupt()).expect("SIGINT");
         let mut term = signal(SignalKind::terminate()).expect("SIGTERM");
         let mut hits = 0u32;
         loop {
-            tokio::select! {
-                _ = int.recv() => {}
-                _ = term.recv() => {}
-            }
+            let sig = tokio::select! {
+                _ = int.recv() => libc::SIGINT,
+                _ = term.recv() => libc::SIGTERM,
+            };
             hits += 1;
             if hits >= 3 {
                 tracing::warn!("exiting now");
-                std::process::exit(130);
+                std::process::exit(128 + sig);
             }
-            let _ = tx.try_send(());
+            let _ = tx.try_send(sig);
         }
     });
 }

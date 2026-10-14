@@ -41,7 +41,7 @@ enum Session {
     /// not complete. This must surface as an error, not a clean exit.
     PeerCancelled,
     /// We ourselves were cancelled.
-    Interrupted,
+    Interrupted(i32),
     BrokenPipe,
     Fatal(String),
 }
@@ -97,7 +97,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
     let (events_tx, mut events_rx) = mpsc::channel::<SinkEvent>(64);
     let (sink, sink_task) = sink::Sink::spawn(&args.common.path, 2, events_tx)?;
 
-    let (signal_tx, mut signal_rx) = mpsc::channel(1);
+    let (signal_tx, mut signal_rx) = mpsc::channel::<i32>(1);
     signals::forward(signal_tx);
 
     let mut attempt = 0u32;
@@ -105,10 +105,10 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
     loop {
         let conn = match net::dial(endpoint, addr.clone()).await {
             Ok(conn) => {
-                // A successful dial proves the inlet is reachable again; the
-                // reconnect budget starts over.
+                // A successful dial only resets the backoff; the reconnect
+                // budget below renews on *progress*, so a peer that accepts
+                // connections but never delivers data still gets bounded.
                 attempt = 0;
-                lost_attempts = 0;
                 conn
             }
             Err(e) if net::transient(&e) => {
@@ -120,15 +120,16 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                     ));
                 }
                 tracing::warn!("connect failed: {e}; retrying");
-                if !net::wait_for_retry(net::backoff(attempt), &mut signal_rx).await {
+                if let Some(sig) = net::wait_for_retry(net::backoff(attempt), &mut signal_rx).await {
                     // Cancelled while retrying: exit like a signal handler.
-                    signals::die_of(libc::SIGINT);
+                    signals::die_of(sig);
                 }
                 continue;
             }
             Err(e) => return Err(e),
         };
 
+        let progress_before = sink.cursor();
         match session(&conn, &sink, &mut events_rx, &mut signal_rx).await {
             Ok(Session::Done) | Ok(Session::PeerBye) => {
                 // The sink may still be flushing the tail; let it finish so the
@@ -146,13 +147,19 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                      the stream did not complete"
                 ));
             }
-            Ok(Session::Interrupted) => signals::die_of(libc::SIGINT),
+            Ok(Session::Interrupted(sig)) => signals::die_of(sig),
             Ok(Session::BrokenPipe) => signals::die_of(libc::SIGPIPE),
             Ok(Session::Fatal(msg)) => {
                 tracing::error!("{msg}");
                 return Err(color_eyre::eyre::eyre!(msg));
             }
             Err(Lost(reason)) => {
+                // The reconnect budget renews only on actual progress: data
+                // that reached the consumer since the last attempt. A peer
+                // that accepts dials but never delivers stays bounded.
+                if sink.cursor() > progress_before {
+                    lost_attempts = 0;
+                }
                 lost_attempts += 1;
                 // First ask the connection why it ended. An application close
                 // means the inlet made a final decision and must not be
@@ -204,8 +211,10 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                             ));
                         }
                         tracing::warn!("connection lost: {reason}; reconnecting");
-                        if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await {
-                            signals::die_of(libc::SIGINT);
+                        if let Some(sig) =
+                            net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
+                        {
+                            signals::die_of(sig);
                         }
                     }
                     net::CloseKind::Lost(why) => {
@@ -217,8 +226,10 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                             ));
                         }
                         tracing::warn!("connection lost: {reason}; reconnecting");
-                        if !net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await {
-                            signals::die_of(libc::SIGINT);
+                        if let Some(sig) =
+                            net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
+                        {
+                            signals::die_of(sig);
                         }
                     }
                 }
@@ -256,7 +267,7 @@ async fn session(
     conn: &Connection,
     sink: &Sink,
     events: &mut mpsc::Receiver<SinkEvent>,
-    signals: &mut mpsc::Receiver<()>,
+    signals: &mut mpsc::Receiver<i32>,
 ) -> Result<Session, Lost> {
     let (send, recv) = conn.open_bi().await.map_err(|e| Lost(e.to_string()))?;
 
@@ -283,13 +294,14 @@ async fn session(
 
             // Local first, so Ctrl-C and a broken downstream are reported
             // promptly even while the stream is saturated.
-            _ = signals.recv() => {
+            sig = signals.recv() => {
                 // The producer's Ctrl-C must reach the inlet: the source dies
                 // of SIGINT, so this goodbye is its only way to learn. Awaited
                 // (bounded) so it cannot be silently dropped by a wedged
                 // writer.
+                let sig = sig.unwrap_or(libc::SIGINT);
                 let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGINT).await;
-                break 'session Ok(Session::Interrupted);
+                break 'session Ok(Session::Interrupted(sig));
             }
 
             // Peer control frames outrank sink acks: a continuously acking
@@ -314,14 +326,19 @@ async fn session(
                             // Promptness over ack-forwarding: a late ack is
                             // recoverable, a missed Ctrl-C or a dead
                             // connection is not.
-                            _ = signals.recv() => break 'session Ok(Session::Interrupted),
+                            sig = signals.recv() => {
+                                break 'session Ok(Session::Interrupted(
+                                    sig.unwrap_or(libc::SIGINT),
+                                ))
+                            }
                             _ = conn.closed() => {
                                 break 'session Err(Lost(
                                     "connection closed while draining the tail".into(),
                                 ))
                             }
 
-                            Some(event) = events.recv() => match event {                                SinkEvent::BrokenPipe => {
+                            Some(event) = events.recv() => match event {
+                                SinkEvent::BrokenPipe => {
                                     // The consumer exited mid-tail. What it
                                     // consumed is the true final count, and
                                     // the producer upstream must get SIGPIPE.
@@ -414,7 +431,7 @@ async fn session(
     // that has not been acked, which could destroy the in-flight SIGINT frame.
     // Wait for the peer to close back first; close as a backstop otherwise.
     match &outcome {
-        Ok(Session::Interrupted) => {
+        Ok(Session::Interrupted(_)) => {
             if timeout(PEER_CLOSE_GRACE, conn.closed()).await.is_err() {
                 net::close_intentional(conn, net::close::CANCEL, "SIGINT");
                 tokio::time::sleep(net::CLOSE_PROPAGATE).await;

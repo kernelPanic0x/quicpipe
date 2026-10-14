@@ -28,7 +28,7 @@ enum Session {
     /// Everything sent and acknowledged.
     Done,
     PeerBye,
-    Interrupted,
+    Interrupted(i32),
     /// The peer's stdout is gone, so ours should die of SIGPIPE too.
     SigPipe,
     Fatal(String),
@@ -62,17 +62,18 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
     tracing::info!("peer is {}", peer_id.fmt_short());
 
     let mut source = source::spawn(&common.path, 2)?;
-    let (signal_tx, mut signal_rx) = mpsc::channel(1);
+    let (signal_tx, mut signal_rx) = mpsc::channel::<i32>(1);
     signals::forward(signal_tx);
 
     let mut window = Window::new(MAX_BUFFERED_BYTES as u64);
     let mut source_done = false;
 
     loop {
-        let Some(conn) = accept(endpoint, peer_id, &mut signal_rx).await else {
-            // Cancelled while waiting for a connection: die like a signal
-            // handler should, so the exit code says 130, not 0.
-            signals::die_of(libc::SIGINT);
+        // Cancelled while waiting for a connection: die like a signal
+        // handler should, so the exit code says 130/143, not 0.
+        let conn = match accept(endpoint, peer_id, &mut signal_rx).await? {
+            Accepted::Connection(conn) => conn,
+            Accepted::Cancelled(sig) => signals::die_of(sig),
         };
 
         match session(
@@ -85,7 +86,7 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
         .await
         {
             Ok(Session::Done) | Ok(Session::PeerBye) => return Ok(()),
-            Ok(Session::Interrupted) => signals::die_of(libc::SIGINT),
+            Ok(Session::Interrupted(sig)) => signals::die_of(sig),
             Ok(Session::SigPipe) => signals::die_of(libc::SIGPIPE),
             Ok(Session::Fatal(msg)) => return Err(eyre!(msg)),
             Err(Lost(reason)) => {
@@ -117,6 +118,12 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
     }
 }
 
+/// What the accept loop produced before it ended.
+enum Accepted {
+    Connection(Connection),
+    Cancelled(i32),
+}
+
 /// Queues a control frame on a possibly congested channel: the writer drains
 /// it continuously, so poll until it accepts the frame instead of betting on a
 /// single timed send.
@@ -137,13 +144,24 @@ async fn queue_ctrl(tx: &mpsc::Sender<InletToOutlet>, msg: InletToOutlet) {
 async fn accept(
     endpoint: &Endpoint,
     peer: PublicKey,
-    signals: &mut mpsc::Receiver<()>,
-) -> Option<Connection> {
+    signals: &mut mpsc::Receiver<i32>,
+) -> Result<Accepted> {
     loop {
         let incoming = select! {
             biased;
-            _ = signals.recv() => return None,
-            incoming = endpoint.accept() => incoming?,
+            sig = signals.recv() => {
+                return Ok(Accepted::Cancelled(sig.unwrap_or(libc::SIGINT)));
+            }
+            incoming = endpoint.accept() => {
+                // A closed endpoint is an infrastructure failure, not a user
+                // cancellation: report it, never disguise it as SIGINT.
+                match incoming {
+                    Some(incoming) => incoming,
+                    None => {
+                        return Err(eyre!("the endpoint stopped accepting connections"));
+                    }
+                }
+            }
         };
         let conn = match incoming.accept() {
             Ok(connecting) => match connecting.await {
@@ -167,7 +185,7 @@ async fn accept(
             );
             continue;
         }
-        return Some(conn);
+        return Ok(Accepted::Connection(conn));
     }
 }
 
@@ -176,7 +194,7 @@ async fn session(
     window: &mut Window,
     source: &mut mpsc::Receiver<source::Msg>,
     source_done: &mut bool,
-    signals: &mut mpsc::Receiver<()>,
+    signals: &mut mpsc::Receiver<i32>,
 ) -> Result<Session, Lost> {
     let (send, recv) = conn.accept_bi().await.map_err(|e| Lost(e.to_string()))?;
 
@@ -260,19 +278,19 @@ async fn session(
             // A stream task died, which means the connection is gone.
             Some(fault) = faults_rx.recv() => break 'session Err(Lost(fault)),
 
-            _ = signals.recv() => {
+            sig = signals.recv() => {
                 // The channel may be jammed with data frames queued behind a
                 // congested stream; the writer drains it continuously, so poll
                 // until it takes the cancellation frame instead of betting on
                 // a single timed send.
                 queue_ctrl(&to_outlet_tx, InletToOutlet::SIGINT).await;
-                break 'session Ok(Session::Interrupted);
+                break 'session Ok(Session::Interrupted(sig.unwrap_or(libc::SIGINT)));
             }
 
             Some(msg) = from_outlet_rx.recv() => match msg {
                 OutletToInlet::Received(n) => window.ack(n),
                 OutletToInlet::Bye => break 'session Ok(Session::PeerBye),
-                OutletToInlet::SIGINT => break 'session Ok(Session::Interrupted),
+                OutletToInlet::SIGINT => break 'session Ok(Session::Interrupted(libc::SIGINT)),
                 OutletToInlet::SIGPIPE => break 'session Ok(Session::SigPipe),
             },
 
@@ -325,7 +343,7 @@ async fn session(
     // cancellation waits for the peer to close back; everything else closes as
     // a backstop announcing the verdict even if the in-band frame was lost.
     match &outcome {
-        Ok(Session::Interrupted) => {
+        Ok(Session::Interrupted(_)) => {
             if timeout(PEER_CLOSE_GRACE, conn.closed()).await.is_err() {
                 net::close_intentional(conn, net::close::CANCEL, "SIGINT");
                 tokio::time::sleep(net::CLOSE_PROPAGATE).await;

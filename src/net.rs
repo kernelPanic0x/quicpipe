@@ -94,7 +94,7 @@ pub const FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// with "peer doesn't support any known protocol". The dialing side needs no
 /// `alpns`, the protocol name rides on `connect`.
 pub async fn bind(key: &SecretKey, accept: bool) -> Result<Endpoint> {
-    // FIX: We don't hava an adroid context in termux, use google DNS.
+    // FIX: We don't have an Android context in Termux, use Google DNS.
     #[cfg(target_os = "android")]
     let mut builder = {
         use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -147,10 +147,15 @@ pub async fn dial(
 
 // Waiting for a retry must stay responsive to Ctrl-C, so the sleep races the
 // signal channel rather than blocking on it.
-pub async fn wait_for_retry(delay: std::time::Duration, signals: &mut mpsc::Receiver<()>) -> bool {
+/// Waits out the backoff. Returns the signal if one arrived (the caller
+/// should die by it), or `None` when the delay elapsed and retrying is due.
+pub async fn wait_for_retry(
+    delay: std::time::Duration,
+    signals: &mut mpsc::Receiver<i32>,
+) -> Option<i32> {
     tokio::select! {
-        _ = tokio::time::sleep(delay) => true,
-        _ = signals.recv() => false,
+        _ = tokio::time::sleep(delay) => None,
+        sig = signals.recv() => Some(sig.unwrap_or(libc::SIGINT)),
     }
 }
 
