@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::thread;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::protocol::CHUNK_SIZE;
@@ -46,35 +46,20 @@ pub fn spawn(path: &Path, capacity: usize) -> std::io::Result<Source> {
                 }
             };
 
-            // Read directly into a reusable BytesMut and freeze the filled
-            // prefix: zero copies per chunk, unlike read-then-copy_from_slice
-            // which would memcpy every byte twice.
-            let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
+            // One copy per chunk: the kernel fills `buf`, we copy the read
+            // prefix into an owned `Bytes` so it can outlive the buffer.
+            // (True zero-copy via `Read::read_buf` is still unstable, and the
+            // `chunk_mut`/raw-pointer pattern is not worth an `unsafe` for
+            // ~0.03% of the transfer's time budget.)
+            let mut buf = vec![0u8; CHUNK_SIZE];
             loop {
-                buf.reserve(CHUNK_SIZE);
-                // SAFETY: `chunk_mut` hands out the uninitialized spare
-                // capacity as a raw pointer. The read below initializes
-                // exactly its first `n` bytes (a successful read(2) always
-                // fills what it reports); `advance_mut(n)` then marks those
-                // bytes as the buffer's live contents, and `split_to(n)`
-                // detaches exactly them into a `Bytes`. The uninitialized
-                // tail remains outside every live view. This is the pattern
-                // the bytes crate documents for zero-copy IO into a
-                // `BytesMut` — the advance is what makes the read visible.
-                let read = {
-                    let chunk = buf.chunk_mut();
-                    let spare =
-                        unsafe { std::slice::from_raw_parts_mut(chunk.as_mut_ptr(), chunk.len()) };
-                    input.read(spare)
-                };
-                match read {
+                match input.read(&mut buf) {
                     Ok(0) => {
                         let _ = tx.blocking_send(Msg::Eof);
                         return;
                     }
                     Ok(n) => {
-                        unsafe { buf.advance_mut(n) };
-                        let chunk = buf.split_to(n).freeze();
+                        let chunk = Bytes::copy_from_slice(buf.get(..n).expect("read reported n bytes"));
                         // This is where backpressure lands: when the replay
                         // window is full the channel fills, this parks, and the
                         // OS pipe upstream backs up.
