@@ -123,16 +123,16 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
 
         match session(&conn, &sink, &mut events_rx, &mut announced_checksum, &mut signal_rx).await {
             Ok(Session::Done | Session::PeerBye) => {
-                // The sink may still be flushing the tail; let it finish so the
-                // last bytes reach the consumer. A stalled sink is an error:
-                // the stream did not fully reach the consumer.
-                finish_sink(&sink, sink_task).await?;
+                // The sink may still be flushing the tail; let it finish, then
+                // the gate inside finish_sink verifies the checksum. Only a
+                // verified transfer exits 0.
+                finish_sink(&sink, sink_task, announced_checksum).await?;
                 return Ok(());
             }
             Ok(Session::PeerCancelled) => {
                 // The bytes received so far are a clean prefix: flush them,
                 // but the exit must stay loud — the stream did not complete.
-                let _ = finish_sink(&sink, sink_task).await;
+                let _ = finish_sink(&sink, sink_task, announced_checksum).await;
                 return Err(eyre!(
                     "the inlet cancelled the transfer (SIGINT); \
                      the stream did not complete"
@@ -155,7 +155,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                         // The bytes received so far are a clean prefix: flush
                         // them, but the exit must stay loud — the stream did
                         // not complete.
-                        let _ = finish_sink(&sink, sink_task).await;
+                        let _ = finish_sink(&sink, sink_task, announced_checksum).await;
                         return Err(eyre!(
                             "the inlet cancelled the transfer (SIGINT); \
                              the stream did not complete"
@@ -170,7 +170,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                         // said `EOF`; a `DONE` arriving without it means the
                         // stream ended early. Data integrity outranks
                         // everything: exit loudly with a non-zero code.
-                        let _ = finish_sink(&sink, sink_task).await;
+                        let _ = finish_sink(&sink, sink_task, announced_checksum).await;
                         return Err(eyre!(
                             "inlet closed with 'done' but never announced EOF: \
                              the stream ended early ({r})"
@@ -181,7 +181,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                         // can trust as complete. Never exit 0 here. Flush the
                         // received prefix first: it is valid data even if the
                         // transfer as a whole failed.
-                        let _ = finish_sink(&sink, sink_task).await;
+                        let _ = finish_sink(&sink, sink_task, announced_checksum).await;
                         return Err(eyre!(
                             "inlet closed the connection unexpectedly ({r}); \
                              the stream is incomplete"
@@ -211,20 +211,41 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
     }
 }
 
-/// Lets the sink flush the tail, then joins its thread. The sink runs on its
-/// own thread, so drain first (bounded), then join.
+/// Lets the sink flush the tail, verify the checksum, then join the writer
+/// thread. The sink runs on its own thread, so drain first (bounded), then
+/// verify, then close.
 ///
-/// Returns an error if the sink did not drain within the budget: exiting
-/// successfully with unwritten tail bytes would be silent truncation, and
-/// data integrity outranks a slow consumer.
+/// This is THE structural exit gate: `Ok(())` from here proves (a) every
+/// queued byte was written, (b) the digest of the bytes handed to the OS
+/// matches what the inlet announced, and (c) the writer exited cleanly.
+/// Successful transfers reach this through the `Done | PeerBye` arm, which
+/// propagates any error - so exit 0 is impossible without a verified
+/// checksum. Error paths call this with `let _ =` to flush the valid prefix
+/// on the way out; their own error is the verdict that matters.
 async fn finish_sink(
     sink: &sink::Sink,
     sink_task: std::thread::JoinHandle<()>,
+    announced_checksum: Option<u64>,
 ) -> Result<()> {
-    if sink::drain(sink, SINK_DRAIN_TIMEOUT).await.is_none() {
+    let Some((_cursor, written_digest)) = sink::drain(sink, SINK_DRAIN_TIMEOUT).await else {
         return Err(eyre!(
             "the sink did not write its tail within {SINK_DRAIN_TIMEOUT:?}; \
              the stream is incomplete"
+        ));
+    };
+    // The integrity verdict: what the inlet's source produced must equal what
+    // we handed to the OS. A mismatch means a protocol bug corrupted the
+    // stream - never exit 0. A missing checksum means verification was
+    // skipped - also never exit 0.
+    let Some(expected) = announced_checksum else {
+        return Err(eyre!(
+            "the inlet never announced a checksum: the stream could not be verified"
+        ));
+    };
+    if expected != written_digest {
+        return Err(eyre!(
+            "checksum mismatch: the inlet sent {expected:#018x}, \
+             we wrote {written_digest:#018x}: the stream is corrupt"
         ));
     }
     // The drain barrier is answered, so the writer thread is alive: now it
