@@ -1,8 +1,6 @@
 use clap::{Args, Parser, Subcommand};
-use color_eyre::eyre::{Context, eyre};
-use iroh::SecretKey;
 use magic_wormhole::{AppID, Code, transfer::APP_CONFIG};
-use std::{borrow::Cow, io::Read, path::PathBuf};
+use std::{borrow::Cow, path::PathBuf};
 
 mod completer;
 mod inlet;
@@ -26,7 +24,10 @@ pub fn init_logging(quiet: bool) {
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 #[derive(Parser)]
@@ -41,10 +42,6 @@ enum Cmd {
     Inlet(InletArgs),
     /// Pipe outlet
     Outlet(OutletArgs),
-    /// Generate an iroh secret key and print it to stdout.
-    GenKey,
-    /// Generate an iroh public key based a secret key read from stdin.
-    GenPub,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -79,31 +76,7 @@ struct CommonArgs {
 
     /// Silence status output (errors only). `RUST_LOG` overrides this.
     #[arg(long, short)]
-    pub quiet: bool,}
-
-fn gen_public_key() -> color_eyre::Result<()> {
-    let mut input = String::new();
-    std::io::stdin()
-        .read_to_string(&mut input)
-        .context("Failed to read from stdin")?;
-
-    let trimmed = input.trim();
-    let bytes = hex::decode(trimmed).context("Invalid hex input")?;
-
-    let secret_key = SecretKey::try_from(bytes.as_slice())
-        .map_err(|e| eyre!("Invalid secret key bytes: {e}"))?;
-
-    let public_key = secret_key.public();
-
-    println!("{public_key}");
-
-    Ok(())
-}
-
-fn gen_secret_key() {
-    let secret_key = SecretKey::generate();
-    let hex = hex::encode(secret_key.to_bytes());
-    println!("{hex}");
+    pub quiet: bool,
 }
 
 async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<i32> {
@@ -125,8 +98,6 @@ async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<i32> {
             init_logging(outlet_args.common.quiet);
             outlet::run(outlet_args).await?;
         }
-        Cmd::GenKey => gen_secret_key(),
-        Cmd::GenPub => gen_public_key()?,
     }
 
     Ok(0)
