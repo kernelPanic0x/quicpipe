@@ -1,6 +1,7 @@
 //! Pure formatting for the status line. Keeping this separate from the
 //! renderer makes the labels and templates unit-testable.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use indicatif::{BinaryBytes, FormattedDuration, ProgressStyle};
@@ -44,6 +45,29 @@ pub fn metrics(speed: f64, remaining: Option<Duration>) -> String {
     format!("{rate} {eta}")
 }
 
+/// Whether SGR escapes should be emitted at all. Set once at startup from
+/// [`color_capable`], so rendering stays allocation-light and the decision is
+/// made a single time.
+static COLOR: AtomicBool = AtomicBool::new(false);
+
+pub fn set_color(on: bool) {
+    COLOR.store(on, Ordering::Relaxed);
+}
+
+/// Whether this host can render colour on stderr: an ANSI-capable terminal,
+/// no `NO_COLOR`, and not a dumb terminal. On Windows this also switches the
+/// console into virtual-terminal mode, so the inline escapes below render
+/// instead of printing literally (and old consoles decline instead).
+pub fn color_capable() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var_os("TERM").is_some_and(|term| term == "dumb") {
+        return false;
+    }
+    crate::platform::enable_ansi()
+}
+
 /// SGR parameters rather than a styling crate: the bar already only exists on
 /// a terminal, and writing the few escapes we need inline keeps the dependency
 /// graph — and therefore dialoguer's console version — untouched.
@@ -58,6 +82,9 @@ const RESET: &str = "\x1b[0m";
 
 /// Paints only the contents of a field, never its brackets.
 fn paint(text: &str, sgr: &str, bold: bool) -> String {
+    if !COLOR.load(Ordering::Relaxed) {
+        return text.to_owned();
+    }
     let weight = if bold { "1;" } else { "" };
     format!("\x1b[{weight}{sgr}m{text}{RESET}")
 }

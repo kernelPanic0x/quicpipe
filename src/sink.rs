@@ -1,9 +1,10 @@
 //! The consumer side: a blocking writer on its own thread that owns the write
 //! cursor.
 //!
-//! The writer task owns the fd *and* the byte cursor, so the dedupe decision and
-//! the write happen in the same task with no window between them. That is what
-//! makes a replayed chunk idempotent rather than merely unlikely to duplicate.
+//! The writer task owns the destination *and* the byte cursor, so "handed to
+//! the OS" and "the cursor advanced" are the same event. Reconnect continuity
+//! comes from draining to this cursor before the next connection; the sink
+//! itself never needs to know that a reconnect happened.
 //!
 //! Using `clio::Output` means `-`, a plain path and friends behave the same,
 //! without hand-rolled open logic, and a slow stdout blocks this thread and not
@@ -22,8 +23,8 @@ pub enum Msg {
     Data(Bytes),
     /// Drain barrier: resolves with (cursor, digest) once everything queued
     /// before it has been written. Used at end-of-stream so the final
-    /// `Received` we send is the true total and the checksum verdict is
-    /// computed over exactly the bytes on the wire.
+    /// `Written` is the true total and the checksum verdict is computed over
+    /// exactly the bytes handed to the OS.
     Barrier(tokio::sync::oneshot::Sender<(u64, u64)>),
     Eof,
 }
@@ -34,7 +35,7 @@ pub enum Event {
     /// connection restates the same truth, so losing an ack costs only memory.
     Ack(u64),
     /// The downstream consumer exited. Ordinary pipe semantics, not an error.
-    BrokenPipe,
+    ConsumerGone,
     Error(String),
 }
 
@@ -116,7 +117,7 @@ fn writer(
                 let len = payload.len() as u64;
                 if let Err(e) = out.write_all(&payload) {
                     let _ = events.blocking_send(if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        Event::BrokenPipe
+                        Event::ConsumerGone
                     } else {
                         Event::Error(e.to_string())
                     });
@@ -145,10 +146,10 @@ fn writer(
             Msg::Eof => {
                 let _ = out.flush();
                 if to_stdout {
-                    // A downstream reader only sees EOF when the last writer
-                    // closes the fd; flush() alone will not do it.
+                    // A downstream reader only sees EOF once the last writer
+                    // closes the destination; flush() alone will not do it.
                     let _ = std::io::stdout().flush();
-                    unsafe { libc::close(1) };
+                    crate::platform::close_stdout();
                 }
                 return;
             }

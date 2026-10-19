@@ -85,7 +85,6 @@ impl<T: Encoder> Decoder for WireCodec<T> {
 }
 
 #[derive(SchemaWrite, SchemaRead, Debug, Clone)]
-#[allow(clippy::upper_case_acronyms)]
 pub enum InletToOutlet {
     /// End-to-end integrity verdict: the XXH3-64 digest of everything the
     /// inlet's source produced. It travels on the control stream; the raw data
@@ -93,26 +92,35 @@ pub enum InletToOutlet {
     /// the bytes it actually wrote; any mismatch — a skipped or duplicated
     /// byte, a bad resume, anything QUIC's per-stream ordering could not see
     /// across a reconnect — fails the transfer loudly.
+    #[wincode(tag = 0)]
     Checksum(u64),
-    /// Ctrl+C
-    SIGINT,
+    /// The outlet no longer wants the bytes. The inlet stops its source and
+    /// exits with the cancellation code; nothing is wrong with the stream.
+    #[wincode(tag = 1)]
+    Cancel,
     /// Unrecoverable: a source read failure, a protocol violation, or a resume
-    /// request that fell outside the replay window. The pipe is over.
+    /// request that fell outside the replay window. The transfer is over.
+    #[wincode(tag = 2)]
     Fatal(String),
 }
 
-#[allow(clippy::upper_case_acronyms)]
 #[derive(SchemaWrite, SchemaRead, Debug, Clone)]
 pub enum OutletToInlet {
-    /// "Everything below this offset has been written to stdout."
+    /// "Everything below this offset has been written to the destination."
     ///
     /// Sent after writes, and as the first frame of every connection — where
     /// it is exactly the resume request. Same meaning, so it is the same frame.
+    #[wincode(tag = 0)]
     Written(u64),
-    /// Ctrl+C
-    SIGINT,
-    /// The outlet's stdout is gone; the producer upstream should get SIGPIPE.
-    SIGPIPE,
+    /// The user cancelled the transfer on this side.
+    #[wincode(tag = 1)]
+    Cancel,
+    /// The outlet's downstream consumer is gone (its output reader exited).
+    /// The inlet must stop producing, exactly like a broken pipe.
+    #[wincode(tag = 2)]
+    ConsumerGone,
+    /// Every byte was written and verified; this is the clean goodbye.
+    #[wincode(tag = 3)]
     Bye,
 }
 
@@ -125,4 +133,31 @@ pub struct HandshakePayload {
     /// Purely advisory: it drives the progress bar and ETA, never the
     /// integrity verdict, which remains the end-to-end checksum.
     pub size: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::pedantic)]
+
+    use super::*;
+
+    /// The wire contract: the leading bytes of a frame are its variant tag
+    /// (wincode's default little-endian `u32`) and a reordering would silently
+    /// reinterpret frames. Renaming variants is free; changing these is not.
+    #[test]
+    fn frame_tags_are_frozen() {
+        let tag = |frame: &[u8]| <[u8; 4]>::try_from(frame.get(..4).unwrap()).unwrap();
+
+        assert_eq!(tag(&InletToOutlet::Checksum(7).encode().unwrap()), [0, 0, 0, 0]);
+        assert_eq!(tag(&InletToOutlet::Cancel.encode().unwrap()), [1, 0, 0, 0]);
+        assert_eq!(
+            tag(&InletToOutlet::Fatal("x".into()).encode().unwrap()),
+            [2, 0, 0, 0]
+        );
+
+        assert_eq!(tag(&OutletToInlet::Written(7).encode().unwrap()), [0, 0, 0, 0]);
+        assert_eq!(tag(&OutletToInlet::Cancel.encode().unwrap()), [1, 0, 0, 0]);
+        assert_eq!(tag(&OutletToInlet::ConsumerGone.encode().unwrap()), [2, 0, 0, 0]);
+        assert_eq!(tag(&OutletToInlet::Bye.encode().unwrap()), [3, 0, 0, 0]);
+    }
 }

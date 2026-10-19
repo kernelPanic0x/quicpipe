@@ -7,6 +7,7 @@ mod inlet;
 mod link;
 mod net;
 mod outlet;
+mod platform;
 mod protocol;
 mod replay;
 mod signals;

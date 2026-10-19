@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::protocol::{ALPN, HandshakePayload};
+use crate::signals::Termination;
 
 /// How long to wait for a connection to reveal *why* it ended when a stream
 /// task failed before the connection itself reported anything.
@@ -24,17 +25,17 @@ pub const CLOSE_PROPAGATE: std::time::Duration = std::time::Duration::from_milli
 
 /// Application close codes carried in the QUIC `CONNECTION_CLOSE` frame.
 ///
-/// These are the authoritative cancellation signal: in-band control frames
-/// (`SIGINT`, `Bye`, `Fatal`) can be lost together with the stream, but the
-/// close code tells the peer definitively whether the other side left on
+/// These are the authoritative verdict: in-band control frames (`Cancel`,
+/// `ConsumerGone`, `Bye`, `Fatal`) can be lost together with the stream, but
+/// the close code tells the peer definitively whether the other side left on
 /// purpose — and therefore whether reconnecting would contradict it.
 pub mod close {
-    /// Clean shutdown: everything was delivered.
+    /// Clean shutdown: everything was delivered and verified.
     pub const DONE: u64 = 0;
-    /// Cancelled by SIGINT/SIGTERM.
-    pub const CANCEL: u64 = 1;
-    /// The peer's downstream consumer is gone.
-    pub const SIGPIPE: u64 = 2;
+    /// The user cancelled one side of the transfer.
+    pub const CANCELLED: u64 = 1;
+    /// The outlet's downstream consumer is gone.
+    pub const CONSUMER_GONE: u64 = 2;
     /// Unrecoverable error on the closing side.
     pub const FATAL: u64 = 3;
 }
@@ -155,11 +156,11 @@ pub async fn dial(
 /// should die by it), or `None` when the delay elapsed and retrying is due.
 pub async fn wait_for_retry(
     delay: std::time::Duration,
-    signals: &mut mpsc::Receiver<i32>,
-) -> Option<i32> {
+    signals: &mut mpsc::Receiver<Termination>,
+) -> Option<Termination> {
     tokio::select! {
         () = tokio::time::sleep(delay) => None,
-        sig = signals.recv() => Some(sig.unwrap_or(libc::SIGINT)),
+        sig = signals.recv() => Some(sig.unwrap_or(Termination::Interrupt)),
     }
 }
 

@@ -15,13 +15,14 @@ use crate::completer::enter_code;
 use crate::protocol::{HandshakePayload, InletToOutlet, OutletToInlet};
 use crate::sink::{self, Event as SinkEvent, Sink};
 use crate::ui::{Phase, Ui, UiConfig};
+use crate::signals::Termination;
 use crate::{OutletArgs, app_config, link, net, signals};
 
 const SINK_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to keep the connection open after announcing cancellation, waiting
-/// for the peer to close back (proof the SIGINT frame was delivered). Only then
-/// is the connection closed as a backstop.
+/// for the peer to close back (proof the cancellation frame was delivered).
+/// Only then is the connection closed as a backstop.
 const PEER_CLOSE_GRACE: Duration = Duration::from_secs(3);
 
 /// How long a control-frame send may wait for the writer to take it before we
@@ -32,12 +33,13 @@ const CTRL_GRACE: Duration = Duration::from_secs(3);
 
 enum Session {
     Done,
-    /// The *peer* was cancelled (SIGINT/SIGTERM): the stream is over but did
+    /// The *peer* was cancelled (Ctrl-C/terminate): the stream is over but did
     /// not complete. This must surface as an error, not a clean exit.
     PeerCancelled,
     /// We ourselves were cancelled.
-    Interrupted(i32),
-    BrokenPipe,
+    Cancelled(Termination),
+    /// Our downstream consumer is gone; the inlet must stop too.
+    ConsumerGone,
     Fatal(String),
 }
 
@@ -112,7 +114,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
     );
     ui.phase(Phase::Connecting);
 
-    let (signal_tx, mut signal_rx) = mpsc::channel::<i32>(1);
+    let (signal_tx, mut signal_rx) = mpsc::channel::<Termination>(1);
     signals::forward(signal_tx);
 
     let mut announced_checksum: Option<u64> = None;
@@ -144,10 +146,10 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                     Phase::Connecting
                 });
                 tracing::warn!("connect failed: {e}; retrying");
-                if let Some(sig) = net::wait_for_retry(net::backoff(attempt), &mut signal_rx).await
+                if let Some(why) = net::wait_for_retry(net::backoff(attempt), &mut signal_rx).await
                 {
                     // Cancelled while retrying: exit like a signal handler.
-                    signals::die_of(sig);
+                    signals::exit(why);
                 }
                 continue;
             }
@@ -177,12 +179,12 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                 // but the exit must stay loud — the stream did not complete.
                 let _ = finish_sink(&sink, sink_task, announced_checksum).await;
                 return Err(eyre!(
-                    "the inlet cancelled the transfer (SIGINT); \
+                    "the inlet cancelled the transfer; \
                      the stream did not complete"
                 ));
             }
-            Ok(Session::Interrupted(sig)) => signals::die_of(sig),
-            Ok(Session::BrokenPipe) => signals::die_of(libc::SIGPIPE),
+            Ok(Session::Cancelled(why)) => signals::exit(why),
+            Ok(Session::ConsumerGone) => signals::exit(Termination::ConsumerGone),
             Ok(Session::Fatal(msg)) => {
                 tracing::error!("{msg}");
                 return Err(color_eyre::eyre::eyre!(msg));
@@ -196,17 +198,17 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                 // second-guessed by a reconnect — this is what keeps the
                 // outlet from redialling an inlet that exited via Ctrl+C.
                 match net::close_kind(&conn).await {
-                    net::CloseKind::App(net::close::CANCEL, _) => {
+                    net::CloseKind::App(net::close::CANCELLED, _) => {
                         // The bytes received so far are a clean prefix: flush
                         // them, but the exit must stay loud — the stream did
                         // not complete.
                         let _ = finish_sink(&sink, sink_task, announced_checksum).await;
                         return Err(eyre!(
-                            "the inlet cancelled the transfer (SIGINT); \
+                            "the inlet cancelled the transfer; \
                              the stream did not complete"
                         ));
                     }
-                    net::CloseKind::App(net::close::SIGPIPE, _) => signals::die_of(libc::SIGPIPE),
+                    net::CloseKind::App(net::close::CONSUMER_GONE, _) => signals::exit(Termination::ConsumerGone),
                     net::CloseKind::App(net::close::FATAL, r) => {
                         return Err(eyre!("inlet reported a fatal error: {r}"));
                     }
@@ -238,10 +240,10 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                             attempt: lost_attempts,
                         });
                         tracing::warn!("connection lost: {reason}; reconnecting");
-                        if let Some(sig) =
+                        if let Some(why) =
                             net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
                         {
-                            signals::die_of(sig);
+                            signals::exit(why);
                         }
                     }
                     net::CloseKind::Lost(why) => {
@@ -252,10 +254,10 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                         tracing::warn!(
                             "connection lost: {reason}; reconnecting (transport: {why})"
                         );
-                        if let Some(sig) =
+                        if let Some(why) =
                             net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
                         {
-                            signals::die_of(sig);
+                            signals::exit(why);
                         }
                     }
                 }
@@ -318,7 +320,7 @@ async fn session(
     sink: &Sink,
     events: &mut mpsc::Receiver<SinkEvent>,
     announced_checksum: &mut Option<u64>,
-    signals: &mut mpsc::Receiver<i32>,
+    signals: &mut mpsc::Receiver<Termination>,
     ui: &Ui,
 ) -> Result<Session, Lost> {
     let (control_send, control_recv) = conn.open_bi().await.map_err(|e| Lost(e.to_string()))?;
@@ -348,14 +350,14 @@ async fn session(
             biased;
 
             received_sig = signals.recv() => {
-                let sig = received_sig.unwrap_or(libc::SIGINT);
-                let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGINT).await;
-                return Ok(Session::Interrupted(sig));
+                let why = received_sig.unwrap_or(Termination::Interrupt);
+                let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Cancel).await;
+                return Ok(Session::Cancelled(why));
             }
 
             Some(msg) = from_inlet_rx.recv() => match msg {
                 InletToOutlet::Checksum(sum) => *announced_checksum = Some(sum),
-                InletToOutlet::SIGINT => return Ok(Session::PeerCancelled),
+                InletToOutlet::Cancel => return Ok(Session::PeerCancelled),
                 InletToOutlet::Fatal(report) => return Ok(Session::Fatal(report)),
             },
 
@@ -380,13 +382,13 @@ async fn session(
             // Local first, so Ctrl-C is reported promptly even while the
             // stream is saturated.
             received_sig = signals.recv() => {
-                // The producer's Ctrl-C must reach the inlet: the source dies
-                // of SIGINT, so this goodbye is its only way to learn. Awaited
+                // The producer's Ctrl-C must reach the inlet: the source is
+                // cancelled, so this goodbye is its only way to learn. Awaited
                 // (bounded) so it cannot be silently dropped by a wedged
                 // writer.
-                let sig = received_sig.unwrap_or(libc::SIGINT);
-                let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGINT).await;
-                break 'session Ok(Session::Interrupted(sig));
+                let why = received_sig.unwrap_or(Termination::Interrupt);
+                let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Cancel).await;
+                break 'session Ok(Session::Cancelled(why));
             }
 
             // Control frames outrank sink acks: a continuously acking sink
@@ -399,7 +401,7 @@ async fn session(
                         break 'session Ok(Session::Done); // placeholder, finalize below
                     }
                 }
-                InletToOutlet::SIGINT => break 'session Ok(Session::PeerCancelled),
+                InletToOutlet::Cancel => break 'session Ok(Session::PeerCancelled),
                 InletToOutlet::Fatal(report) => break 'session Ok(Session::Fatal(report)),
             },
 
@@ -418,15 +420,15 @@ async fn session(
                     // next one, and the greeting on the next connection.
                     let _ = to_inlet_tx.try_send(OutletToInlet::Written(n));
                 }
-                SinkEvent::BrokenPipe => {
+                SinkEvent::ConsumerGone => {
                     // Our consumer is gone. Tell the inlet so its producer dies
                     // too, then die like a pipe ourselves. Both frames are
                     // awaited (bounded): this goodbye is the producer's only
-                    // SIGPIPE, so it must not be silently dropped by a wedged
+                    // consumer-gone verdict, so it must not be silently dropped by a wedged
                     // writer.
-                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGPIPE).await;
+                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::ConsumerGone).await;
                     let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await;
-                    break 'session Ok(Session::BrokenPipe);
+                    break 'session Ok(Session::ConsumerGone);
                 }
                 SinkEvent::Error(e) => break 'session Ok(Session::Fatal(e)),
             },
@@ -473,12 +475,12 @@ async fn session(
 
     // Announce the verdict at the transport level. For cancellation the
     // connection must NOT be closed right away: `close` discards stream data
-    // that has not been acked, which could destroy the in-flight SIGINT frame.
+    // that has not been acked, which could destroy the in-flight cancellation frame.
     // Wait for the peer to close back first; close as a backstop otherwise.
     match &verdict {
-        Ok(Session::Interrupted(_)) => {
+        Ok(Session::Cancelled(_)) => {
             if timeout(PEER_CLOSE_GRACE, conn.closed()).await.is_err() {
-                net::close_intentional(conn, net::close::CANCEL, "SIGINT");
+                net::close_intentional(conn, net::close::CANCELLED, "cancelled");
                 tokio::time::sleep(net::CLOSE_PROPAGATE).await;
             }
         }
@@ -487,11 +489,11 @@ async fn session(
             tokio::time::sleep(net::CLOSE_PROPAGATE).await;
         }
         Ok(Session::PeerCancelled) => {
-            net::close_intentional(conn, net::close::CANCEL, "SIGINT");
+            net::close_intentional(conn, net::close::CANCELLED, "cancelled");
             tokio::time::sleep(net::CLOSE_PROPAGATE).await;
         }
-        Ok(Session::BrokenPipe) => {
-            net::close_intentional(conn, net::close::SIGPIPE, "SIGPIPE");
+        Ok(Session::ConsumerGone) => {
+            net::close_intentional(conn, net::close::CONSUMER_GONE, "consumer gone");
             tokio::time::sleep(net::CLOSE_PROPAGATE).await;
         }
         Ok(Session::Fatal(msg)) => {
@@ -510,7 +512,7 @@ async fn finalize(
     sink: &Sink,
     events: &mut mpsc::Receiver<SinkEvent>,
     announced_checksum: Option<u64>,
-    signals: &mut mpsc::Receiver<i32>,
+    signals: &mut mpsc::Receiver<Termination>,
     to_inlet_tx: &mpsc::Sender<OutletToInlet>,
     conn: &Connection,
 ) -> Result<Session, Lost> {
@@ -519,17 +521,17 @@ async fn finalize(
             biased;
 
             received_sig = signals.recv() => {
-                return Ok(Session::Interrupted(received_sig.unwrap_or(libc::SIGINT)));
+                return Ok(Session::Cancelled(received_sig.unwrap_or(Termination::Interrupt)));
             }
             _ = conn.closed() => {
                 return Err(Lost("connection closed while draining the tail".into()));
             }
 
             Some(event) = events.recv() => match event {
-                SinkEvent::BrokenPipe => {
-                    let _ = send_ctrl(to_inlet_tx, OutletToInlet::SIGPIPE).await;
+                SinkEvent::ConsumerGone => {
+                    let _ = send_ctrl(to_inlet_tx, OutletToInlet::ConsumerGone).await;
                     let _ = send_ctrl(to_inlet_tx, OutletToInlet::Bye).await;
-                    return Ok(Session::BrokenPipe);
+                    return Ok(Session::ConsumerGone);
                 }
                 SinkEvent::Error(e) => return Ok(Session::Fatal(e)),
                 SinkEvent::Ack(n) => {

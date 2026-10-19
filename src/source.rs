@@ -34,7 +34,7 @@ pub struct Source {
 }
 
 /// `capacity` is deliberately tiny: the replay window is the real buffer, and a
-/// deep channel here would only add latency to the SIGPIPE path.
+/// deep channel here would only add latency to the consumer-gone path.
 pub fn spawn(path: &Path, capacity: usize) -> std::io::Result<Source> {
     let owned_path = path.to_owned();
     let (tx, rx) = mpsc::channel::<Msg>(capacity);

@@ -55,14 +55,19 @@ pub enum Phase {
 
 pub struct UiConfig {
     enabled: bool,
+    color: bool,
 }
 
 impl UiConfig {
     /// `--quiet` and non-TTY stderr both disable the bar. The latter is what
     /// keeps `quicpipe ... | tee log` free of escape sequences.
     pub fn new(quiet: bool) -> Self {
+        let enabled = !quiet && std::io::stderr().is_terminal();
         Self {
-            enabled: !quiet && std::io::stderr().is_terminal(),
+            enabled,
+            // Colour is a separate question from drawing the bar: a terminal
+            // may support one and not the other, and `NO_COLOR` must win.
+            color: enabled && render::color_capable(),
         }
     }
 }
@@ -86,6 +91,7 @@ impl Ui {
         if !cfg.enabled {
             return Self { inner: None };
         }
+        render::set_color(cfg.color);
 
         // `ProgressBar::new_spinner` enables a steady tick immediately, which
         // would draw one frame before the style, prefix and metrics are set.

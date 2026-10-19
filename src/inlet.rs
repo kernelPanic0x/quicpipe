@@ -17,22 +17,24 @@ use tokio::time::{Duration, timeout};
 use crate::protocol::{HandshakePayload, InletToOutlet, MAX_BUFFERED_BYTES, OutletToInlet};
 use crate::replay::Window;
 use crate::ui::{Phase, Ui, UiConfig};
+use crate::signals::Termination;
 use crate::{InletArgs, app_config, link, net, signals, size, source};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const CTRL_GRACE: Duration = Duration::from_secs(3);
 
 /// How long to keep the connection open after announcing cancellation, waiting
-/// for the peer to close back (proof the SIGINT frame was delivered). Only then
-/// is the connection closed as a backstop.
+/// for the peer to close back (proof the cancellation frame was delivered).
+/// Only then is the connection closed as a backstop.
 const PEER_CLOSE_GRACE: Duration = Duration::from_secs(3);
 
 enum Session {
     /// The outlet wrote, verified and acknowledged everything.
     PeerBye,
-    Interrupted(i32),
-    /// The peer's stdout is gone, so ours should die of SIGPIPE too.
-    SigPipe,
+    /// The user cancelled this side of the transfer.
+    Cancelled(Termination),
+    /// The outlet's downstream consumer is gone, so ours must stop too.
+    ConsumerGone,
     Fatal(String),
 }
 
@@ -71,7 +73,7 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
     tracing::info!("peer is {}", peer_id.fmt_short());
 
     let mut source = source::spawn(&common.path, 2)?;
-    let (signal_tx, mut signal_rx) = mpsc::channel::<i32>(1);
+    let (signal_tx, mut signal_rx) = mpsc::channel::<Termination>(1);
     signals::forward(signal_tx);
 
     let mut window = Window::new(MAX_BUFFERED_BYTES as u64);
@@ -84,7 +86,7 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
         // handler should, so the exit code says 130/143, not 0.
         let conn = match accept(endpoint, peer_id, &mut signal_rx).await? {
             Accepted::Connection(conn) => conn,
-            Accepted::Cancelled(sig) => signals::die_of(sig),
+            Accepted::Cancelled(why) => signals::exit(why),
         };
         ui.watch_connection(&conn);
         ui.phase(Phase::Transferring);
@@ -104,8 +106,8 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
                 ui.finish_success();
                 return Ok(());
             }
-            Ok(Session::Interrupted(sig)) => signals::die_of(sig),
-            Ok(Session::SigPipe) => signals::die_of(libc::SIGPIPE),
+            Ok(Session::Cancelled(why)) => signals::exit(why),
+            Ok(Session::ConsumerGone) => signals::exit(Termination::ConsumerGone),
             Ok(Session::Fatal(msg)) => return Err(eyre!(msg)),
             Err(Lost(reason)) => {
                 ui.clear_connection();
@@ -117,8 +119,8 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
                         ui.finish_success();
                         return Ok(());
                     }
-                    net::CloseKind::App(net::close::CANCEL, _) => signals::die_of(libc::SIGINT),
-                    net::CloseKind::App(net::close::SIGPIPE, _) => signals::die_of(libc::SIGPIPE),
+                    net::CloseKind::App(net::close::CANCELLED, _) => signals::exit(Termination::Interrupt),
+                    net::CloseKind::App(net::close::CONSUMER_GONE, _) => signals::exit(Termination::ConsumerGone),
                     net::CloseKind::App(net::close::FATAL, r) => {
                         return Err(eyre!("outlet reported a fatal error: {r}"));
                     }
@@ -145,7 +147,7 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
 /// What the accept loop produced before it ended.
 enum Accepted {
     Connection(Connection),
-    Cancelled(i32),
+    Cancelled(Termination),
 }
 
 /// Queues a control frame on a possibly congested channel: the writer drains
@@ -174,17 +176,17 @@ async fn queue_ctrl(tx: &mpsc::Sender<InletToOutlet>, msg: InletToOutlet) {
 async fn accept(
     endpoint: &Endpoint,
     peer: PublicKey,
-    signals: &mut mpsc::Receiver<i32>,
+    signals: &mut mpsc::Receiver<Termination>,
 ) -> Result<Accepted> {
     loop {
         let incoming = select! {
             biased;
-            sig = signals.recv() => {
-                return Ok(Accepted::Cancelled(sig.unwrap_or(libc::SIGINT)));
+            why = signals.recv() => {
+                return Ok(Accepted::Cancelled(why.unwrap_or(Termination::Interrupt)));
             }
             incoming = endpoint.accept() => {
                 // A closed endpoint is an infrastructure failure, not a user
-                // cancellation: report it, never disguise it as SIGINT.
+                // cancellation: report it, never disguise it as a cancellation.
                 match incoming {
                     Some(next) => next,
                     None => {
@@ -225,7 +227,7 @@ async fn session(
     source: &mut mpsc::Receiver<source::Msg>,
     source_done: &mut bool,
     source_checksum: &mut Option<u64>,
-    signals: &mut mpsc::Receiver<i32>,
+    signals: &mut mpsc::Receiver<Termination>,
     position: &AtomicU64,
 ) -> Result<Session, Lost> {
     let (control_send, control_recv) = conn.accept_bi().await.map_err(|e| Lost(e.to_string()))?;
@@ -318,11 +320,11 @@ async fn session(
             // A stream task died, which means the connection is gone.
             Some(fault) = faults_rx.recv() => break 'session Err(Lost(fault)),
 
-            sig = signals.recv() => {
+            why = signals.recv() => {
                 // The control channel is tiny; poll until the writer takes the
                 // cancellation frame rather than betting on one timed send.
-                queue_ctrl(&to_outlet_tx, InletToOutlet::SIGINT).await;
-                break 'session Ok(Session::Interrupted(sig.unwrap_or(libc::SIGINT)));
+                queue_ctrl(&to_outlet_tx, InletToOutlet::Cancel).await;
+                break 'session Ok(Session::Cancelled(why.unwrap_or(Termination::Interrupt)));
             }
 
             Some(msg) = from_outlet_rx.recv() => match msg {
@@ -331,8 +333,8 @@ async fn session(
                     position.fetch_max(n, Ordering::Relaxed);
                 }
                 OutletToInlet::Bye => break 'session Ok(Session::PeerBye),
-                OutletToInlet::SIGINT => break 'session Ok(Session::Interrupted(libc::SIGINT)),
-                OutletToInlet::SIGPIPE => break 'session Ok(Session::SigPipe),
+                OutletToInlet::Cancel => break 'session Ok(Session::Cancelled(Termination::Interrupt)),
+                OutletToInlet::ConsumerGone => break 'session Ok(Session::ConsumerGone),
             },
 
             () = std::future::ready(()), if can_replay => {
@@ -388,7 +390,7 @@ async fn session(
     // writer is aborted instead of delaying teardown.
     drop(data_tx);
     match &outcome {
-        Ok(Session::Interrupted(_) | Session::SigPipe | Session::Fatal(_)) | Err(_) => {
+        Ok(Session::Cancelled(_) | Session::ConsumerGone | Session::Fatal(_)) | Err(_) => {
             data_writer.abort();
         }
         Ok(Session::PeerBye) => {
@@ -404,14 +406,14 @@ async fn session(
 
     // Announce the verdict at the transport level. For cancellation the
     // connection must NOT be closed right away: `close` discards stream data
-    // that has not been acked, which could destroy the in-flight SIGINT frame.
+    // that has not been acked, which could destroy the in-flight cancellation frame.
     // The stream is the reliable channel (QUIC retransmits it until acked), so
     // cancellation waits for the peer to close back; everything else closes as
     // a backstop announcing the verdict even if the in-band frame was lost.
     match &outcome {
-        Ok(Session::Interrupted(_)) => {
+        Ok(Session::Cancelled(_)) => {
             if timeout(PEER_CLOSE_GRACE, conn.closed()).await.is_err() {
-                net::close_intentional(conn, net::close::CANCEL, "SIGINT");
+                net::close_intentional(conn, net::close::CANCELLED, "cancelled");
                 tokio::time::sleep(net::CLOSE_PROPAGATE).await;
             }
         }
@@ -419,8 +421,8 @@ async fn session(
             net::close_intentional(conn, net::close::DONE, "done");
             tokio::time::sleep(net::CLOSE_PROPAGATE).await;
         }
-        Ok(Session::SigPipe) => {
-            net::close_intentional(conn, net::close::SIGPIPE, "SIGPIPE");
+        Ok(Session::ConsumerGone) => {
+            net::close_intentional(conn, net::close::CONSUMER_GONE, "consumer gone");
             tokio::time::sleep(net::CLOSE_PROPAGATE).await;
         }
         Ok(Session::Fatal(msg)) => {
