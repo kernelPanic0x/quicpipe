@@ -74,9 +74,27 @@ quicpipe outlet -c 7-crimson-otter restored.sql
 
 You can also set the wormhole code via the environment: `QUICPIPE_CODE`, and the rendezvous server via `WORMHOLE_MAILBOX_URL`.
 
+### Progress and sizes
+
+When stderr is a terminal, quicpipe shows a pv-style status line while it works:
+connection state (`direct`, `via relay`, `connecting`, `reconnecting`), a progress
+bar, throughput and ETA. Piped or `--quiet` output stays clean (stdout is always
+reserved for pipe data).
+
+The inlet auto-detects the size of a regular input file, and of stdin when it is
+redirected from a regular file. For pipes, pass the size explicitly:
+
+```sh
+some-command | quicpipe inlet -s 2G
+```
+
+Suffixes are binary to match the bar: `k`/`Ki` = 1024, `M`/`Mi` = 1024², and so
+on. The inlet sends the size to the outlet, so both sides show a total. The size
+only drives progress and ETA; the end-to-end checksum remains the integrity check.
+
 ### Output control
 
-Status messages go to stderr (stdout is reserved for pipe data). By default only quicpipe's own status lines (and errors from any library) are printed; use `--quiet`/`-q` to silence everything but errors, or set `RUST_LOG` for finer control (e.g. `RUST_LOG=debug` also shows iroh's internals for troubleshooting).
+Status and logs go to stderr (stdout is reserved for pipe data). By default the progress bar is the only status indication and library logs are silent; use `--quiet`/`-q` to also hide the bar, or set `RUST_LOG` for logs (e.g. `RUST_LOG=debug` also shows iroh's internals for troubleshooting).
 
 ## 🐚 Embedded in rescue-shell
 

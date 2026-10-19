@@ -2,6 +2,8 @@
 //! its source, so stdin and a seekable file are handled identically.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
@@ -12,9 +14,10 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
-use crate::protocol::{HandshakePayload, MAX_BUFFERED_BYTES, InletToOutlet, OutletToInlet};
+use crate::protocol::{HandshakePayload, InletToOutlet, MAX_BUFFERED_BYTES, OutletToInlet};
 use crate::replay::Window;
-use crate::{InletArgs, app_config, link, net, signals, source};
+use crate::ui::{Phase, Ui, UiConfig};
+use crate::{InletArgs, app_config, link, net, signals, size, source};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const CTRL_GRACE: Duration = Duration::from_secs(3);
@@ -50,12 +53,19 @@ pub async fn run(args: InletArgs) -> Result<()> {
 
 async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) -> Result<()> {
     let common = &args.common;
+    // Explicit -s wins; otherwise a regular file (or a regular stdin) gives
+    // an exact total. Pipes have no meaningful size and stay unknown.
+    let total = args.common.size.or_else(|| size::detect(&common.path));
+    let position = Arc::new(AtomicU64::new(0));
+    let ui = Ui::start(&UiConfig::new(common.quiet), total, &position);
+
     let mailbox = MailboxConnection::create(app_config(common), args.code_length).await?;
-    eprintln!("Wormhole Code: {}", mailbox.code());
+    ui.notice(format!("Wormhole Code: {}", mailbox.code()));
+    ui.phase(Phase::WaitingForPeer);
     tracing::info!("waiting for the other end...");
     let mut wormhole = Wormhole::connect(mailbox).await?;
     wormhole
-        .send(wincode::serialize(&net::payload_for(endpoint, key))?)
+        .send(wincode::serialize(&net::payload_for(endpoint, key, total))?)
         .await?;
     let peer: HandshakePayload = wincode::deserialize(&wormhole.receive().await?)?;
     let peer_id = PublicKey::from_bytes(&peer.public_key)?;
@@ -68,6 +78,7 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
     let mut window = Window::new(MAX_BUFFERED_BYTES as u64);
     let mut source_done = false;
     let mut source_checksum: Option<u64> = None;
+    let mut attempt = 0u32;
 
     loop {
         // Cancelled while waiting for a connection: die like a signal
@@ -76,6 +87,8 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
             Accepted::Connection(conn) => conn,
             Accepted::Cancelled(sig) => signals::die_of(sig),
         };
+        ui.watch_connection(&conn);
+        ui.phase(Phase::Transferring);
 
         match session(
             &conn,
@@ -84,19 +97,27 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
             &mut source_done,
             &mut source_checksum,
             &mut signal_rx,
+            &position,
         )
         .await
         {
-            Ok(Session::Done | Session::PeerBye) => return Ok(()),
+            Ok(Session::Done | Session::PeerBye) => {
+                ui.finish_success();
+                return Ok(());
+            }
             Ok(Session::Interrupted(sig)) => signals::die_of(sig),
             Ok(Session::SigPipe) => signals::die_of(libc::SIGPIPE),
             Ok(Session::Fatal(msg)) => return Err(eyre!(msg)),
             Err(Lost(reason)) => {
+                ui.clear_connection();
                 // A lost connection is only worth waiting on if the peer did
                 // not leave on purpose: its close code is the definitive
                 // verdict, surviving even a lost in-band control frame.
                 match net::close_kind(&conn).await {
-                    net::CloseKind::App(net::close::DONE, _) => return Ok(()),
+                    net::CloseKind::App(net::close::DONE, _) => {
+                        ui.finish_success();
+                        return Ok(());
+                    }
                     net::CloseKind::App(net::close::CANCEL, _) => signals::die_of(libc::SIGINT),
                     net::CloseKind::App(net::close::SIGPIPE, _) => signals::die_of(libc::SIGPIPE),
                     net::CloseKind::App(net::close::FATAL, r) => {
@@ -112,6 +133,8 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
                         ));
                     }
                     net::CloseKind::TimedOut | net::CloseKind::Lost(_) => {
+                        attempt = attempt.saturating_add(1);
+                        ui.phase(Phase::Reconnecting { attempt });
                         tracing::warn!("connection lost: {reason}; waiting for a reconnect");
                     }
                 }
@@ -135,8 +158,7 @@ async fn queue_ctrl(tx: &mpsc::Sender<InletToOutlet>, msg: InletToOutlet) {
         match tx.try_send(msg.clone()) {
             // Success and a torn-down session both end the queueing loop;
             // the close code takes over.
-            Ok(())
-            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
             // The writer drains the channel continuously, so Full is a brief
             // congestion.
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -205,6 +227,7 @@ async fn session(
     source_done: &mut bool,
     source_checksum: &mut Option<u64>,
     signals: &mut mpsc::Receiver<i32>,
+    position: &AtomicU64,
 ) -> Result<Session, Lost> {
     let (send, recv) = conn.accept_bi().await.map_err(|e| Lost(e.to_string()))?;
 
@@ -246,6 +269,7 @@ async fn session(
     // The resume point is acknowledged: the bytes below it can leave the window
     // and the accounting after a reconnect starts from where the peer is.
     window.ack(resume_from);
+    position.fetch_max(resume_from, Ordering::Relaxed);
 
     tracing::info!(
         "outlet connected; replaying from byte {resume_from} \
@@ -269,7 +293,11 @@ async fn session(
             // sent, so the true end of the stream is this exact frame —
             // however many connections it takes to deliver it.
             let checksum = source_checksum.expect("source_done implies a checksum");
-            let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Checksum(checksum))).await;
+            let _ = timeout(
+                CTRL_GRACE,
+                to_outlet_tx.send(InletToOutlet::Checksum(checksum)),
+            )
+            .await;
             let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::EOF)).await;
             eof_queued = true;
         }
@@ -301,7 +329,10 @@ async fn session(
             }
 
             Some(msg) = from_outlet_rx.recv() => match msg {
-                OutletToInlet::Received(n) => window.ack(n),
+                OutletToInlet::Received(n) => {
+                    window.ack(n);
+                    position.fetch_max(n, Ordering::Relaxed);
+                }
                 OutletToInlet::Bye => break 'session Ok(Session::PeerBye),
                 OutletToInlet::SIGINT => break 'session Ok(Session::Interrupted(libc::SIGINT)),
                 OutletToInlet::SIGPIPE => break 'session Ok(Session::SigPipe),

@@ -11,19 +11,17 @@ mod protocol;
 mod replay;
 mod signals;
 mod sink;
+mod size;
 mod source;
+mod ui;
 
-/// Initialize logging: `RUST_LOG` wins if set, otherwise `--quiet` maps to
-/// error-only, otherwise errors from any crate plus quicpipe status lines.
-/// Everything goes to stderr, never to stdout (stdout is the pipe payload).
-pub fn init_logging(quiet: bool) {
-    let default_filter = if quiet {
-        "error"
-    } else {
-        "error,quicpipe=info"
-    };
+/// Initialize logging: `RUST_LOG` wins if set. Otherwise logs stay silent and
+/// the progress bar is the only status indication; `--quiet` additionally
+/// disables the bar. Errors are still reported by the exit path. Everything
+/// goes to stderr, never to stdout (stdout is the pipe payload).
+pub fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -77,6 +75,26 @@ struct CommonArgs {
     /// Silence status output (errors only). `RUST_LOG` overrides this.
     #[arg(long, short)]
     pub quiet: bool,
+
+    /// Total size of the input, e.g. 500M, 1.5GiB or 734003200.
+    /// Suffixes are binary, matching pv and the progress bar: k/Ki = 1024,
+    /// M/Mi = 1024², and so on.
+    /// The inlet transmits this to the outlet so both sides can show progress.
+    /// On the inlet it is auto-detected for regular files when omitted.
+    #[arg(
+        long,
+        short = 's',
+        value_name = "BYTES",
+        value_parser = parse_byte_size
+    )]
+    pub size: Option<u64>,
+}
+
+/// `parse-size` defaults to decimal prefixes (`1k` = 1000), which would make
+/// `-s 8M` disagree with the binary units the progress bar displays. pv-style
+/// binary suffixes keep the two consistent.
+fn parse_byte_size(input: &str) -> Result<u64, parse_size::Error> {
+    parse_size::Config::new().with_binary().parse_size(input)
 }
 
 async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<i32> {
@@ -91,11 +109,11 @@ async fn async_main(argv: Vec<std::ffi::OsString>) -> color_eyre::Result<i32> {
 
     match cli.cmd {
         Cmd::Inlet(inlet_args) => {
-            init_logging(inlet_args.common.quiet);
+            init_logging();
             inlet::run(inlet_args).await?;
         }
         Cmd::Outlet(outlet_args) => {
-            init_logging(outlet_args.common.quiet);
+            init_logging();
             outlet::run(outlet_args).await?;
         }
     }
@@ -132,4 +150,27 @@ fn app_config(
         config = config.rendezvous_url(Cow::Owned(url.to_string()));
     }
     config
+}
+
+#[cfg(test)]
+mod size_arg_tests {
+    #![allow(clippy::unwrap_used, clippy::pedantic)]
+
+    use super::parse_byte_size;
+
+    #[test]
+    fn suffixes_are_binary_to_match_the_progress_bar() {
+        assert_eq!(parse_byte_size("8M").unwrap(), 8 * 1024 * 1024);
+        assert_eq!(parse_byte_size("1Ki").unwrap(), 1024);
+        assert_eq!(
+            parse_byte_size("1.5GiB").unwrap(),
+            1024 * 1024 * 1024 + 512 * 1024 * 1024
+        );
+        assert_eq!(parse_byte_size("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn malformed_sizes_are_rejected() {
+        assert!(parse_byte_size("12x").is_err());
+    }
 }

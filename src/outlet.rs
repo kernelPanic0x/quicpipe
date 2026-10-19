@@ -12,8 +12,9 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::completer::enter_code;
-use crate::protocol::{OutletToInlet, HandshakePayload, InletToOutlet};
+use crate::protocol::{HandshakePayload, InletToOutlet, OutletToInlet};
 use crate::sink::{self, Event as SinkEvent, Sink};
+use crate::ui::{Phase, Ui, UiConfig};
 use crate::{OutletArgs, app_config, link, net, signals};
 
 const SINK_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,18 +69,28 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
     }
     let code = args.code.take();
 
-    let mailbox = MailboxConnection::connect(
-        app_config(&args.common),
-        code.expect("Code set"),
-        false,
-    )
-    .await?;
+    let mailbox =
+        MailboxConnection::connect(app_config(&args.common), code.expect("Code set"), false)
+            .await?;
     let mut wormhole = Wormhole::connect(mailbox).await?;
     wormhole
-        .send(wincode::serialize(&net::payload_for(endpoint, key))?)
+        .send(wincode::serialize(&net::payload_for(endpoint, key, None))?)
         .await?;
     let peer: HandshakePayload = wincode::deserialize(&wormhole.receive().await?)?;
     let peer_id = PublicKey::from_bytes(&peer.public_key)?;
+
+    // The inlet's advertised total is authoritative. `-s` on the outlet is a
+    // fallback for peers that do not announce one (and an expectation the
+    // inlet's value silently overrides, since only it knows the source).
+    if let (Some(announced), Some(declared)) = (peer.size, args.common.size)
+        && announced != declared
+    {
+        tracing::warn!(
+            "inlet announced {announced} bytes but outlet -s says {declared}; \
+             using the inlet's value"
+        );
+    }
+    let total = peer.size.or(args.common.size);
 
     let mut addr = EndpointAddr::new(peer_id);
     if let Some(relay) = &peer.relay_url {
@@ -93,12 +104,22 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
     let (events_tx, mut events_rx) = mpsc::channel::<SinkEvent>(64);
     let (sink, sink_task) = sink::Sink::spawn(&args.common.path, 2, events_tx)?;
 
+    // The sink's own cursor is the position source: it advances exactly when
+    // bytes are handed to the OS, which is the truth the bar should show.
+    let ui = Ui::start(
+        &UiConfig::new(args.common.quiet),
+        total,
+        &sink.cursor_handle(),
+    );
+    ui.phase(Phase::Connecting);
+
     let (signal_tx, mut signal_rx) = mpsc::channel::<i32>(1);
     signals::forward(signal_tx);
 
     let mut announced_checksum: Option<u64> = None;
     let mut attempt = 0u32;
     let mut lost_attempts = 0u32;
+    let mut ever_connected = false;
     loop {
         let conn = match net::dial(endpoint, addr.clone()).await {
             Ok(conn) => {
@@ -106,13 +127,26 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                 // budget below renews on *progress*, so a peer that accepts
                 // connections but never delivers data still gets bounded.
                 attempt = 0;
+                ever_connected = true;
+                ui.watch_connection(&conn);
+                ui.phase(Phase::Transferring);
                 conn
             }
             Err(e) if net::transient(&e) => {
                 attempt += 1;
                 lost_attempts += 1;
+                // Before the first connection this is still "connecting";
+                // only a lost established connection is a *re*connect.
+                ui.phase(if ever_connected {
+                    Phase::Reconnecting {
+                        attempt: lost_attempts,
+                    }
+                } else {
+                    Phase::Connecting
+                });
                 tracing::warn!("connect failed: {e}; retrying");
-                if let Some(sig) = net::wait_for_retry(net::backoff(attempt), &mut signal_rx).await {
+                if let Some(sig) = net::wait_for_retry(net::backoff(attempt), &mut signal_rx).await
+                {
                     // Cancelled while retrying: exit like a signal handler.
                     signals::die_of(sig);
                 }
@@ -121,12 +155,22 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
             Err(e) => return Err(e),
         };
 
-        match session(&conn, &sink, &mut events_rx, &mut announced_checksum, &mut signal_rx).await {
+        match session(
+            &conn,
+            &sink,
+            &mut events_rx,
+            &mut announced_checksum,
+            &mut signal_rx,
+            &ui,
+        )
+        .await
+        {
             Ok(Session::Done | Session::PeerBye) => {
                 // The sink may still be flushing the tail; let it finish, then
                 // the gate inside finish_sink verifies the checksum. Only a
                 // verified transfer exits 0.
                 finish_sink(&sink, sink_task, announced_checksum).await?;
+                ui.finish_success();
                 return Ok(());
             }
             Ok(Session::PeerCancelled) => {
@@ -146,6 +190,8 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
             }
             Err(Lost(reason)) => {
                 lost_attempts += 1;
+                ui.clear_connection();
+                ui.phase(Phase::Connecting);
                 // First ask the connection why it ended. An application close
                 // means the inlet made a final decision and must not be
                 // second-guessed by a reconnect — this is what keeps the
@@ -189,6 +235,9 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                     }
                     net::CloseKind::TimedOut => {
                         // Only an ordinary network failure may be retried.
+                        ui.phase(Phase::Reconnecting {
+                            attempt: lost_attempts,
+                        });
                         tracing::warn!("connection lost: {reason}; reconnecting");
                         if let Some(sig) =
                             net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
@@ -198,7 +247,12 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                     }
                     net::CloseKind::Lost(why) => {
                         // Only an ordinary network failure may be retried.
-                        tracing::warn!("connection lost: {reason}; reconnecting (transport: {why})");
+                        ui.phase(Phase::Reconnecting {
+                            attempt: lost_attempts,
+                        });
+                        tracing::warn!(
+                            "connection lost: {reason}; reconnecting (transport: {why})"
+                        );
                         if let Some(sig) =
                             net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
                         {
@@ -250,7 +304,10 @@ async fn finish_sink(
     }
     // The drain barrier is answered, so the writer thread is alive: now it
     // takes the EOF, which flushes and closes the fd for downstream readers.
-    if timeout(CTRL_GRACE, sink.tx.send(sink::Msg::Eof)).await.is_err() {
+    if timeout(CTRL_GRACE, sink.tx.send(sink::Msg::Eof))
+        .await
+        .is_err()
+    {
         return Err(eyre!("the sink did not accept EOF"));
     }
     let _ = tokio::task::spawn_blocking(move || sink_task.join()).await;
@@ -263,6 +320,7 @@ async fn session(
     events: &mut mpsc::Receiver<SinkEvent>,
     announced_checksum: &mut Option<u64>,
     signals: &mut mpsc::Receiver<i32>,
+    ui: &Ui,
 ) -> Result<Session, Lost> {
     let (send, recv) = conn.open_bi().await.map_err(|e| Lost(e.to_string()))?;
 
@@ -305,6 +363,7 @@ async fn session(
             // close destroys the unacked frame.
             Some(msg) = from_inlet_rx.recv() => match msg {
                 InletToOutlet::EOF => {
+                    ui.phase(Phase::Verifying);
                     // Let the sink finish the tail. Deliberately *no* timeout:
                     // a slow consumer is the downstream's own backpressure,
                     // exactly as with an ordinary pipe, and exiting before the

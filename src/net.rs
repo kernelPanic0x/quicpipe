@@ -122,14 +122,18 @@ pub async fn bind(key: &SecretKey, accept: bool) -> Result<Endpoint> {
     Ok(builder.bind().await?)
 }
 
-pub fn payload_for(endpoint: &Endpoint, key: &SecretKey) -> HandshakePayload {
+pub fn payload_for(endpoint: &Endpoint, key: &SecretKey, size: Option<u64>) -> HandshakePayload {
     let addr = endpoint.addr();
     HandshakePayload {
         public_key: *key.public().as_bytes(),
         // The relay URL survives NAT rebinds and interface changes; the direct
         // addresses are only a shortcut and will go stale.
-        relay_url: addr.relay_urls().next().map(std::string::ToString::to_string),
+        relay_url: addr
+            .relay_urls()
+            .next()
+            .map(std::string::ToString::to_string),
         direct_addresses: addr.ip_addrs().copied().collect::<Vec<SocketAddr>>(),
+        size,
     }
 }
 

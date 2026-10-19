@@ -127,4 +127,8 @@ pub struct HandshakePayload {
     pub public_key: [u8; 32],
     pub relay_url: Option<String>,
     pub direct_addresses: Vec<SocketAddr>,
+    /// Total size of the inlet's source when known (`-s` or auto-detected).
+    /// Purely advisory: it drives the progress bar and ETA, never the
+    /// integrity verdict, which remains the end-to-end checksum.
+    pub size: Option<u64>,
 }

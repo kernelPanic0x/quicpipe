@@ -72,6 +72,12 @@ impl Sink {
     pub fn cursor(&self) -> u64 {
         self.written.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Shared cursor handle for the progress UI. It advances only after a
+    /// successful write, so the bar reflects delivered bytes, not queued ones.
+    pub fn cursor_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.written)
+    }
 }
 
 /// Waits for everything already queued to be written, and reports the cursor
