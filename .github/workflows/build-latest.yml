@@ -2,8 +2,11 @@ name: Build and Release Latest
 
 on:
   push:
+    # `direct-streaming` is experimental: it gets its own release tag so it can
+    # be downloaded and tested without touching the `latest` build.
     branches:
       - main
+      - direct-streaming
     paths:
       - 'src/**'
       - 'Cargo.**'
@@ -171,8 +174,12 @@ jobs:
   publish:
     name: Update Latest Release
     needs: build
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/direct-streaming'
     runs-on: ubuntu-latest
+    env:
+      # main owns `latest`; every other publishing branch gets its own tag.
+      RELEASE_TAG: ${{ github.ref_name == 'main' && 'latest' || format('latest-{0}', github.ref_name) }}
+      RELEASE_TITLE: quicpipe ${{ github.ref_name }} Development Build
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -187,11 +194,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest --yes --cleanup-tag || true
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag || true
           sleep 2
-          gh release create latest \
+          gh release create "$RELEASE_TAG" \
             --target ${{ github.sha }} \
-            --title "quicpipe Development Build" \
-            --notes "Automated build from the main branch. Pre-release — not yet stable." \
+            --title "$RELEASE_TITLE" \
+            --notes "Automated build from the ${{ github.ref_name }} branch. Pre-release — not yet stable." \
             --prerelease \
             ./${{ env.BINARY_NAME }}-*
