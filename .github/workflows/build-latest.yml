@@ -25,8 +25,12 @@ env:
 
 jobs:
   test:
-    name: Protocol tests
-    runs-on: ubuntu-latest
+    name: Protocol tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -91,18 +95,16 @@ jobs:
             ext: ""
 
           # --- Windows ---
-          # Disabled: quicpipe relies on Unix signals (SIGPIPE/SIGTERM
-          # handling) that have no equivalent on Windows.
-          # - target: x86_64-pc-windows-msvc
-          #   os: windows-latest
-          #   use_zigbuild: false
-          #   rustflags: "-C target-feature=+crt-static"
-          #   ext: ".exe"
-          # - target: aarch64-pc-windows-msvc
-          #   os: windows-latest
-          #   use_zigbuild: false
-          #   rustflags: "-C target-feature=+crt-static"
-          #   ext: ".exe"
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_zigbuild: false
+            rustflags: "-C target-feature=+crt-static"
+            ext: ".exe"
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            use_zigbuild: false
+            rustflags: "-C target-feature=+crt-static"
+            ext: ".exe"
 
     steps:
       - name: Checkout code
