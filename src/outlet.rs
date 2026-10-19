@@ -427,7 +427,6 @@ async fn session(
                     // consumer-gone verdict, so it must not be silently dropped by a wedged
                     // writer.
                     let _ = send_ctrl(&to_inlet_tx, OutletToInlet::ConsumerGone).await;
-                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await;
                     break 'session Ok(Session::ConsumerGone);
                 }
                 SinkEvent::Error(e) => break 'session Ok(Session::Fatal(e)),
@@ -521,7 +520,12 @@ async fn finalize(
             biased;
 
             received_sig = signals.recv() => {
-                return Ok(Session::Cancelled(received_sig.unwrap_or(Termination::Interrupt)));
+                // The tail is not acknowledged yet, so the inlet must not
+                // mistake our close for success. Same contract as the main
+                // session loop: report the cancellation before returning.
+                let why = received_sig.unwrap_or(Termination::Interrupt);
+                let _ = send_ctrl(to_inlet_tx, OutletToInlet::Cancel).await;
+                return Ok(Session::Cancelled(why));
             }
             _ = conn.closed() => {
                 return Err(Lost("connection closed while draining the tail".into()));
@@ -530,7 +534,6 @@ async fn finalize(
             Some(event) = events.recv() => match event {
                 SinkEvent::ConsumerGone => {
                     let _ = send_ctrl(to_inlet_tx, OutletToInlet::ConsumerGone).await;
-                    let _ = send_ctrl(to_inlet_tx, OutletToInlet::Bye).await;
                     return Ok(Session::ConsumerGone);
                 }
                 SinkEvent::Error(e) => return Ok(Session::Fatal(e)),
@@ -552,20 +555,8 @@ async fn finalize(
         ));
     };
 
-    // The goodbye is the inlet's only way to reach success, so it must be
-    // delivered: both frames are awaited, and a failure becomes `Lost` instead
-    // of ending the session silently. On reconnect the greeting restates the
-    // same cursor, so the handshake converges.
-    if !send_ctrl(to_inlet_tx, OutletToInlet::Written(tail_end)).await {
-        return Err(Lost("could not deliver the final ack".into()));
-    }
-    if !send_ctrl(to_inlet_tx, OutletToInlet::Bye).await {
-        return Err(Lost("could not deliver the goodbye".into()));
-    }
-
-    // The integrity verdict: what the inlet's source produced must equal what
-    // we handed to the OS. A mismatch means a protocol bug corrupted the
-    // stream — never exit 0.
+    // The integrity verdict comes first: `Bye` is the inlet's only success
+    // signal, so it must never travel before the digest is verified.
     let Some(expected) = announced_checksum else {
         return Ok(Session::Fatal(
             "the inlet sent EOF without a checksum".into(),
@@ -576,6 +567,17 @@ async fn finalize(
             "checksum mismatch: the inlet sent {expected:#018x}, \
              we wrote {written_digest:#018x}: the stream is corrupt"
         )));
+    }
+
+    // The goodbye is the inlet's only way to reach success, so it must be
+    // delivered: both frames are awaited, and a failure becomes `Lost` instead
+    // of ending the session silently. On reconnect the greeting restates the
+    // same cursor, so the handshake converges.
+    if !send_ctrl(to_inlet_tx, OutletToInlet::Written(tail_end)).await {
+        return Err(Lost("could not deliver the final ack".into()));
+    }
+    if !send_ctrl(to_inlet_tx, OutletToInlet::Bye).await {
+        return Err(Lost("could not deliver the goodbye".into()));
     }
 
     // All data is written and verified; `finish_sink` now sends the sink's own

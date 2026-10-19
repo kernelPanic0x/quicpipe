@@ -87,7 +87,9 @@ transport loss; an application close (`DONE`, `CANCELLED`, `CONSUMER_GONE`,
 The inlet announces `Checksum` when the source ends. The outlet drains every
 queued byte to the OS, then compares the digest of exactly what it handed to
 the destination with the announced value. A mismatch, or a missing checksum,
-fails the transfer: exit zero is impossible without a verified digest.
+fails the transfer: exit zero is impossible without a verified digest. The
+`Bye` frame is therefore sent only *after* the comparison succeeds; a receiver
+must never treat an earlier ack or a bare stream close as success.
 
 This is what makes resume safe across arbitrary reconnects without per-chunk
 offsets: the end-to-end hash sees any duplication, omission or bad offset,
