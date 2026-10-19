@@ -283,7 +283,9 @@ async fn session(
     position.fetch_max(resume_from, Ordering::Relaxed);
 
     let data_send = conn.open_uni().await.map_err(|e| Lost(e.to_string()))?;
-    let (data_out, data_rx) = mpsc::channel::<Bytes>(2);
+    // A little depth here lets the session loop pull from the source while the
+    // writer is inside a large `write_all`, instead of alternating turns.
+    let (data_out, data_rx) = mpsc::channel::<Bytes>(8);
     let mut data_tx = Some(data_out);
     let data_writer = link::write_bytes(data_send, data_rx, faults_tx.clone());
     let mut data_closed = false;

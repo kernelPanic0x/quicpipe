@@ -103,7 +103,13 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
     tracing::info!("connecting to {}", peer_id.fmt_short());
 
     let (events_tx, mut events_rx) = mpsc::channel::<SinkEvent>(64);
-    let (sink, sink_task) = sink::Sink::spawn(&args.common.path, 2, events_tx)?;
+    // 64 × 256 KiB = 16 MiB of slack in front of the blocking writer. The old
+    // depth of two made the async reader wait for the writer thread to wake on
+    // almost every chunk; locally that alone capped throughput at ~150 MB/s
+    // even though the transport sustains >500 MB/s. Deeper than this showed no
+    // further gain; the remaining cost is the separate control stream's share
+    // of the transport scheduler.
+    let (sink, sink_task) = sink::Sink::spawn(&args.common.path, 64, events_tx)?;
 
     // The sink's own cursor is the position source: it advances exactly when
     // bytes are handed to the OS, which is the truth the bar should show.
