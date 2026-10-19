@@ -28,8 +28,7 @@ const CTRL_GRACE: Duration = Duration::from_secs(3);
 const PEER_CLOSE_GRACE: Duration = Duration::from_secs(3);
 
 enum Session {
-    /// Everything sent and acknowledged.
-    Done,
+    /// The outlet wrote, verified and acknowledged everything.
     PeerBye,
     Interrupted(i32),
     /// The peer's stdout is gone, so ours should die of SIGPIPE too.
@@ -101,7 +100,7 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
         )
         .await
         {
-            Ok(Session::Done | Session::PeerBye) => {
+            Ok(Session::PeerBye) => {
                 ui.finish_success();
                 return Ok(());
             }
@@ -229,39 +228,41 @@ async fn session(
     signals: &mut mpsc::Receiver<i32>,
     position: &AtomicU64,
 ) -> Result<Session, Lost> {
-    let (send, recv) = conn.accept_bi().await.map_err(|e| Lost(e.to_string()))?;
+    let (control_send, control_recv) = conn.accept_bi().await.map_err(|e| Lost(e.to_string()))?;
 
-    let (to_outlet_tx, to_outlet_rx) = mpsc::channel::<InletToOutlet>(2);
-    let (from_outlet_tx, mut from_outlet_rx) = mpsc::channel::<OutletToInlet>(4);
+    let (to_outlet_tx, to_outlet_rx) = mpsc::channel::<InletToOutlet>(4);
+    let (from_outlet_tx, mut from_outlet_rx) = mpsc::channel::<OutletToInlet>(8);
     let (faults_tx, mut faults_rx) = mpsc::channel::<String>(2);
 
-    link::read_half(recv, from_outlet_tx, faults_tx.clone());
-    let writer = link::write_half(send, to_outlet_rx, faults_tx.clone());
+    link::read_half(control_recv, from_outlet_tx, faults_tx.clone());
+    let control_writer = link::write_half(control_send, to_outlet_rx, faults_tx.clone());
 
     // The first frame is the outlet saying how much it has written, which is
     // also exactly where it wants us to resume from.
     let resume_from = match timeout(HANDSHAKE_TIMEOUT, from_outlet_rx.recv()).await {
-        Ok(Some(OutletToInlet::Received(n))) => n,
+        Ok(Some(OutletToInlet::Written(n))) => n,
         Ok(Some(other)) => return Err(Lost(format!("expected the resume point, got {other:?}"))),
         Ok(None) => return Err(Lost("outlet left before greeting".into())),
         Err(_) => return Err(Lost("outlet did not greet us in time".into())),
     };
 
-    let mut backlog: VecDeque<(u64, Bytes)> = match window.replay_from(resume_from) {
-        Ok(chunks) => chunks.into(),
+    // Offsets stay internal to the replay window. Once the bytes are rebuilt
+    // from `resume_from`, the data stream itself is just bytes in order.
+    let mut backlog: VecDeque<Bytes> = match window.replay_from(resume_from) {
+        Ok(chunks) => chunks.into_iter().map(|(_offset, payload)| payload).collect(),
         Err(out_of_range) => {
             // Bytes are gone. Inventing them would silently corrupt the stream,
             // so refuse loudly and let the exit code carry the verdict.
             let msg = out_of_range.to_string();
             tracing::error!("{msg}");
-            net::close_intentional(conn, net::close::FATAL, "fatal");
             let _ = timeout(
                 CTRL_GRACE,
                 to_outlet_tx.send(InletToOutlet::Fatal(msg.clone())),
             )
             .await;
             drop(to_outlet_tx);
-            let _ = timeout(CTRL_GRACE, writer).await;
+            let _ = timeout(CTRL_GRACE, control_writer).await;
+            net::close_intentional(conn, net::close::FATAL, "fatal");
             return Ok(Session::Fatal(msg));
         }
     };
@@ -271,46 +272,44 @@ async fn session(
     window.ack(resume_from);
     position.fetch_max(resume_from, Ordering::Relaxed);
 
+    let data_send = conn.open_uni().await.map_err(|e| Lost(e.to_string()))?;
+    let (data_out, data_rx) = mpsc::channel::<Bytes>(2);
+    let mut data_tx = Some(data_out);
+    let data_writer = link::write_bytes(data_send, data_rx, faults_tx.clone());
+    let mut data_closed = false;
+    let mut checksum_sent = false;
+
     tracing::info!(
-        "outlet connected; replaying from byte {resume_from} \
+        "outlet connected; resuming from byte {resume_from} \
          ({} chunks buffered, {} unacknowledged)",
         backlog.len(),
         window.unacked()
     );
 
-    let mut eof_queued = false;
     let outcome: Result<Session, Lost> = 'session: loop {
-        // All control frames are delivered here, with an await, so none of them
-        // can be lost to a full channel. The body runs after the select has
-        // completed, so a brief await can only delay Lost detection, never
-        // corrupt framing: each frame is tiny and the writer forwards promptly.
-        // Top-of-loop, so it fires even when the final ack arrived in the same
-        // iteration as the last data frame.
-        if *source_done && !eof_queued && backlog.is_empty() {
-            // The checksum goes first so the outlet has the verdict in hand
-            // when EOF arrives, and EOF goes first and alone: everything the
-            // source produced is now either buffered for replay or already
-            // sent, so the true end of the stream is this exact frame —
-            // however many connections it takes to deliver it.
+        // The checksum travels on the control stream as soon as the source is
+        // exhausted; the outlet waits for both this frame and the data FIN.
+        if *source_done && !checksum_sent {
             let checksum = source_checksum.expect("source_done implies a checksum");
             let _ = timeout(
                 CTRL_GRACE,
                 to_outlet_tx.send(InletToOutlet::Checksum(checksum)),
             )
             .await;
-            let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::EOF)).await;
-            eof_queued = true;
-        }
-        if *source_done && eof_queued && window.unacked() == 0 {
-            let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Bye)).await;
-            break 'session Ok(Session::Done);
+            checksum_sent = true;
         }
 
-        // Replay strictly before new bytes: order is the contract, and the
-        // source is only read once the backlog is drained and the window has
-        // room. That guard is the backpressure.
-        let can_replay = !backlog.is_empty() && to_outlet_tx.capacity() > 0;
-        let has_room = !window.is_full() && to_outlet_tx.capacity() > 0;
+        // Once every byte is either replayed or still queued in the data
+        // channel, dropping the sender lets the writer drain and FIN the
+        // stream. This is the raw replacement for a separate EOF frame.
+        if *source_done && !data_closed && backlog.is_empty() {
+            data_tx = None;
+            data_closed = true;
+        }
+
+        let data_slot = data_tx.as_ref().is_some_and(|tx| tx.capacity() > 0);
+        let can_replay = !backlog.is_empty() && data_slot;
+        let has_room = !window.is_full() && data_slot;
         let can_pull = !*source_done && has_room && backlog.is_empty();
 
         select! {
@@ -320,16 +319,14 @@ async fn session(
             Some(fault) = faults_rx.recv() => break 'session Err(Lost(fault)),
 
             sig = signals.recv() => {
-                // The channel may be jammed with data frames queued behind a
-                // congested stream; the writer drains it continuously, so poll
-                // until it takes the cancellation frame instead of betting on
-                // a single timed send.
+                // The control channel is tiny; poll until the writer takes the
+                // cancellation frame rather than betting on one timed send.
                 queue_ctrl(&to_outlet_tx, InletToOutlet::SIGINT).await;
                 break 'session Ok(Session::Interrupted(sig.unwrap_or(libc::SIGINT)));
             }
 
             Some(msg) = from_outlet_rx.recv() => match msg {
-                OutletToInlet::Received(n) => {
+                OutletToInlet::Written(n) => {
                     window.ack(n);
                     position.fetch_max(n, Ordering::Relaxed);
                 }
@@ -339,8 +336,8 @@ async fn session(
             },
 
             () = std::future::ready(()), if can_replay => {
-                if let Some((offset, payload)) = backlog.pop_front() {
-                    let _ = to_outlet_tx.try_send(InletToOutlet::Data { offset, payload });
+                if let (Some(tx), Some(payload)) = (&data_tx, backlog.pop_front()) {
+                    let _ = tx.try_send(payload);
                 }
             }
 
@@ -350,15 +347,21 @@ async fn session(
             // and a disabled branch is still evaluated.
             msg = source.recv(), if can_pull => match msg {
                 Some(source::Msg::Data(chunk)) => {
-                    let (offset, payload) = window.push(chunk);
-                    let _ = to_outlet_tx.try_send(InletToOutlet::Data { offset, payload });
+                    window.push(chunk.clone());
+                    if let Some(tx) = &data_tx {
+                        let _ = tx.try_send(chunk);
+                    }
                 }
                 Some(source::Msg::Eof { checksum }) => {
                     *source_done = true;
                     *source_checksum = Some(checksum);
                 }
                 Some(source::Msg::Error(e)) => {
-                    let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Fatal(e.clone()))).await;
+                    let _ = timeout(
+                        CTRL_GRACE,
+                        to_outlet_tx.send(InletToOutlet::Fatal(e.clone())),
+                    )
+                    .await;
                     break 'session Ok(Session::Fatal(e));
                 }
                 // The only sender lives inside the source thread, so a closed
@@ -367,7 +370,11 @@ async fn session(
                 // EOF for a truncated stream is the one lie worth avoiding.
                 None => {
                     let msg = "source thread exited without finishing".to_string();
-                    let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::Fatal(msg.clone()))).await;
+                    let _ = timeout(
+                        CTRL_GRACE,
+                        to_outlet_tx.send(InletToOutlet::Fatal(msg.clone())),
+                    )
+                    .await;
                     break 'session Ok(Session::Fatal(msg));
                 }
             },
@@ -376,10 +383,24 @@ async fn session(
         }
     };
 
-    // Dropping the sender ends the writer task, which flushes and finishes the
-    // stream. Waiting for it means a queued `Bye` or `Fatal` still lands.
+    // Dropping the data sender lets the raw writer flush queued bytes and FIN.
+    // On a lost/cancelled connection there is no peer left to flush to, so the
+    // writer is aborted instead of delaying teardown.
+    drop(data_tx);
+    match &outcome {
+        Ok(Session::Interrupted(_) | Session::SigPipe | Session::Fatal(_)) | Err(_) => {
+            data_writer.abort();
+        }
+        Ok(Session::PeerBye) => {
+            let _ = timeout(CTRL_GRACE, data_writer).await;
+        }
+    }
     drop(to_outlet_tx);
-    let _ = timeout(CTRL_GRACE, writer).await;
+    if outcome.is_err() {
+        control_writer.abort();
+    } else {
+        let _ = timeout(CTRL_GRACE, control_writer).await;
+    }
 
     // Announce the verdict at the transport level. For cancellation the
     // connection must NOT be closed right away: `close` discards stream data
@@ -394,7 +415,7 @@ async fn session(
                 tokio::time::sleep(net::CLOSE_PROPAGATE).await;
             }
         }
-        Ok(Session::Done | Session::PeerBye) => {
+        Ok(Session::PeerBye) => {
             net::close_intentional(conn, net::close::DONE, "done");
             tokio::time::sleep(net::CLOSE_PROPAGATE).await;
         }

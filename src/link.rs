@@ -6,6 +6,7 @@
 //!
 //! Connection setup (bind, dial, retry/backoff) lives in `net.rs`.
 
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use iroh::endpoint::{RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -37,6 +38,28 @@ pub fn read_half<T: Encoder + Send + 'static>(
             }
         }
     });
+}
+
+/// Writes raw bytes until the channel closes, then FINs the stream.
+///
+/// There is no framing here on purpose: QUIC already delivers this stream in
+/// order and intact. Reconnect continuity is established by the control
+/// handshake, not by per-chunk offsets.
+pub fn write_bytes(
+    mut send: SendStream,
+    mut rx: mpsc::Receiver<Bytes>,
+    faults: mpsc::Sender<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            if let Err(e) = send.write_all(&chunk).await {
+                let _ = faults.try_send(format!("write data: {e}"));
+                return;
+            }
+        }
+        let _ = send.finish();
+        let _ = timeout(FLUSH_GRACE, send.stopped()).await;
+    })
 }
 
 /// Publishes outbound frames until the channel closes, then finishes the stream

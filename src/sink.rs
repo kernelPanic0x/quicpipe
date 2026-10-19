@@ -16,14 +16,10 @@ use bytes::Bytes;
 use iroh::endpoint::RecvStream;
 use tokio::sync::mpsc;
 
-use crate::protocol::InletToOutlet;
 
 #[derive(Debug)]
 pub enum Msg {
-    Data {
-        offset: u64,
-        payload: Bytes,
-    },
+    Data(Bytes),
     /// Drain barrier: resolves with (cursor, digest) once everything queued
     /// before it has been written. Used at end-of-stream so the final
     /// `Received` we send is the true total and the checksum verdict is
@@ -39,11 +35,6 @@ pub enum Event {
     Ack(u64),
     /// The downstream consumer exited. Ordinary pipe semantics, not an error.
     BrokenPipe,
-    /// The sender started beyond our cursor. Unrecoverable.
-    Gap {
-        expected: u64,
-        got: u64,
-    },
     Error(String),
 }
 
@@ -121,22 +112,9 @@ fn writer(
             return;
         };
         match msg {
-            Msg::Data { offset, payload } => {
-                let done = cursor.load(std::sync::atomic::Ordering::SeqCst);
-                let end = offset + payload.len() as u64;
-                let fresh = if end <= done {
-                    continue; // a replay of bytes we already wrote
-                } else if offset > done {
-                    let _ = events.blocking_send(Event::Gap {
-                        expected: done,
-                        got: offset,
-                    });
-                    return;
-                } else {
-                    payload.slice(usize::try_from(done - offset).expect("within the chunk")..)
-                };
-
-                if let Err(e) = out.write_all(&fresh) {
+            Msg::Data(payload) => {
+                let len = payload.len() as u64;
+                if let Err(e) = out.write_all(&payload) {
                     let _ = events.blocking_send(if e.kind() == std::io::ErrorKind::BrokenPipe {
                         Event::BrokenPipe
                     } else {
@@ -144,14 +122,18 @@ fn writer(
                     });
                     return;
                 }
-                // Only now is it true. `Received` means "handed to the OS", not
+                // Only now is it true. `Written` means "handed to the OS", not
                 // "durably stored", and the doc says so.
-                let total = done + fresh.len() as u64;
+                let total = cursor.load(std::sync::atomic::Ordering::SeqCst) + len;
                 cursor.store(total, std::sync::atomic::Ordering::SeqCst);
-                hasher.update(&fresh);
+                hasher.update(&payload);
                 if total > acked {
                     acked = total;
-                    let _ = events.blocking_send(Event::Ack(total));
+                    // Advisory and superseded by the next ack (or by the
+                    // resume handshake), so a full channel must not stall the
+                    // writer while no session is consuming events during a
+                    // reconnect drain.
+                    let _ = events.try_send(Event::Ack(total));
                 }
             }
             Msg::Barrier(reply) => {
@@ -174,35 +156,45 @@ fn writer(
     }
 }
 
-/// Routes inbound frames: bulk data straight to the sink, control to the session.
+/// Reads raw bytes from the data stream and queues them for the writer.
 ///
-/// Data goes to the sink directly so that a full sink queue backpressures the
-/// QUIC stream, rather than being absorbed by the session loop.
+/// The stream is ordered and reliable within one connection; reconnect
+/// continuity comes from the drained cursor in the handshake, never from
+/// per-chunk offsets. A chunk read but not yet queued when the connection dies
+/// is simply replayed by the inlet.
 pub fn pump(
-    recv: RecvStream,
+    mut recv: RecvStream,
     sink: mpsc::Sender<Msg>,
-    ctrl: mpsc::Sender<InletToOutlet>,
+    data_end: mpsc::Sender<()>,
     faults: mpsc::Sender<String>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let (tx, mut rx) = mpsc::channel::<InletToOutlet>(4);
-        crate::link::read_half(recv, tx, faults.clone());
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                InletToOutlet::Data { offset, payload } => {
-                    if sink.send(Msg::Data { offset, payload }).await.is_err() {
+        loop {
+            match recv.read_chunk(READ_CHUNK).await {
+                Ok(Some(payload)) => {
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    if sink.send(Msg::Data(payload)).await.is_err() {
                         return; // sink gone; the session will notice
                     }
                 }
-                other => {
-                    if ctrl.send(other).await.is_err() {
-                        return;
-                    }
+                Ok(None) => {
+                    let _ = data_end.try_send(());
+                    return;
+                }
+                Err(e) => {
+                    let _ = faults.try_send(format!("read data: {e}"));
+                    return;
                 }
             }
         }
-    });
+    })
 }
+
+/// Local read granularity on the consumer side. Independent of the wire now:
+/// QUIC segments as it likes, and ack frequency is the only thing this tunes.
+const READ_CHUNK: usize = 256 * 1024;
 
 #[cfg(test)]
 mod sink_tests {
@@ -214,16 +206,11 @@ mod sink_tests {
     )]
 
     use super::*;
-    use crate::protocol::CHUNK_SIZE;
 
-    /// Feeds frames through the real writer thread against a real temp file,
-    /// then returns (file bytes, final cursor). This is the black-box
-    /// corruption test: whatever interleaving goes in, the file must be a
-    /// correct prefix of the intended stream, or a Gap/Error must have fired.
-    /// Feeds frames through the real writer thread against a real temp file,
+    /// Feeds messages through the real writer thread against a real temp file,
     /// then returns (file bytes, final cursor if the writer was still alive,
     /// observed events). The drain happens before any terminal event so the
-    /// cursor reflects exactly the frames sent so far.
+    /// cursor reflects exactly the bytes sent so far.
     async fn run(frames: Vec<Msg>, terminate: bool) -> (Vec<u8>, Option<(u64, u64)>, Vec<Event>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("out.bin");
@@ -231,8 +218,6 @@ mod sink_tests {
         let (sink, task) = Sink::spawn(&path, 64, events_tx).expect("spawn sink");
 
         for frame in frames {
-            // The writer may already have exited (e.g. after a Gap), in which
-            // case sending fails and that is the test's verdict, not a hang.
             if sink.tx.send(frame).await.is_err() {
                 break;
             }
@@ -256,68 +241,30 @@ mod sink_tests {
         (std::fs::read(&path).expect("read file"), cursor, events)
     }
 
-    fn data(offset: u64, s: &[u8]) -> Msg {
-        Msg::Data {
-            offset,
-            payload: Bytes::copy_from_slice(s),
-        }
+    fn data(s: &[u8]) -> Msg {
+        Msg::Data(Bytes::copy_from_slice(s))
     }
 
     #[tokio::test]
     async fn sequential_writes_are_exact() {
-        let (bytes, cursor, events) = run(
-            vec![data(0, b"hello "), data(6, b"world")],
-            true,
-        )
-        .await;
+        let (bytes, cursor, events) = run(vec![data(b"hello "), data(b"world")], true).await;
         assert_eq!(bytes, b"hello world");
-        assert_eq!(cursor, Some((11, xxhash_rust::xxh3::xxh3_64(b"hello world"))));
+        assert_eq!(
+            cursor,
+            Some((11, xxhash_rust::xxh3::xxh3_64(b"hello world")))
+        );
         assert!(events.iter().all(|e| matches!(e, Event::Ack(_))));
     }
 
     #[tokio::test]
-    async fn duplicates_and_replays_are_idempotent() {
-        // Same bytes delivered twice, and an overlapping resend that starts
-        // below the cursor: the file must not change and the cursor must not
-        // move beyond the true end.
-        let (bytes, cursor, _) = run(
-            vec![
-                data(0, b"abcdef"),
-                data(0, b"abcdef"), // full duplicate
-                data(2, b"cdefgh"), // partial overlap, same prefix
-                data(6, b"gh"),     // duplicate tail
-            ],
-            true,
-        )
-        .await;
-        assert_eq!(bytes, b"abcdefgh");
-        assert_eq!(cursor, Some((8, xxhash_rust::xxh3::xxh3_64(b"abcdefgh"))));
-    }
-
-    #[tokio::test]
-    async fn a_gap_is_a_fatal_not_a_silent_skip() {
-        let (bytes, cursor, events) = run(
-            vec![data(0, b"abc"), data(10, b"xyz")], // starts beyond the cursor
-            false,
-        )
-        .await;
-        assert_eq!(bytes, b"abc"); // the valid prefix is intact
-        assert_eq!(cursor, None); // the writer exited, so no barrier answer
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                Event::Gap { expected: 3, got: 10 }
-            )),
-            "expected a Gap event, got {events:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn chunk_larger_than_one_write_is_fine() {
-        let big = vec![0xABu8; CHUNK_SIZE * 2];
-        let (bytes, cursor, _) = run(vec![data(0, &big)], true).await;
+        let big = vec![0xABu8; 512 * 1024];
+        let (bytes, cursor, _) = run(vec![data(&big)], true).await;
         assert_eq!(bytes.len(), big.len());
-        assert_eq!(cursor, Some((big.len() as u64, xxhash_rust::xxh3::xxh3_64(&big))));
+        assert_eq!(
+            cursor,
+            Some((big.len() as u64, xxhash_rust::xxh3::xxh3_64(&big)))
+        );
         assert!(bytes.iter().all(|&b| b == 0xAB));
     }
 
@@ -325,7 +272,7 @@ mod sink_tests {
     async fn eof_reaches_the_file() {
         // The Eof path must flush AND release the file so a downstream reader
         // sees the data; verify by reading after the writer thread exits.
-        let (bytes, cursor, _) = run(vec![data(0, b"tail")], true).await;
+        let (bytes, cursor, _) = run(vec![data(b"tail")], true).await;
         assert_eq!(bytes, b"tail");
         assert_eq!(cursor, Some((4, xxhash_rust::xxh3::xxh3_64(b"tail"))));
     }

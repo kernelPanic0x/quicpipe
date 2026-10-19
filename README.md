@@ -30,6 +30,8 @@ Pipes that die like real pipes: `quicpipe` dies by `SIGPIPE`/`SIGINT` just like 
 
 The wormhole code is only used to exchange the iroh endpoint addresses and public keys, securely and out-of-band. All pipe data flows directly between the two machines, end-to-end encrypted. If a direct connection fails, an encrypted relay is used automatically. Reconnects survive NAT rebinds and changing interfaces, so flaky links don't kill your transfer.
 
+On the wire there are two streams per connection: a small framed control stream (resume offset, delivered-bytes acks, cancellation and fatal verdicts) and a raw byte stream carrying the source from the resume offset to EOF. There is no per-chunk offset or length framing — QUIC already delivers the data stream in order and intact. An XXH3-64 checksum is announced on the control stream when the source ends and verified by the outlet after every byte is written, so a resumed transfer can never pass as complete unless it reproduced the source exactly.
+
 ## 🚀 Usage
 
 ### Stream a file to another machine

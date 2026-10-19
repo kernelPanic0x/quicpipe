@@ -32,7 +32,6 @@ const CTRL_GRACE: Duration = Duration::from_secs(3);
 
 enum Session {
     Done,
-    PeerBye,
     /// The *peer* was cancelled (SIGINT/SIGTERM): the stream is over but did
     /// not complete. This must surface as an error, not a clean exit.
     PeerCancelled,
@@ -165,7 +164,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
         )
         .await
         {
-            Ok(Session::Done | Session::PeerBye) => {
+            Ok(Session::Done) => {
                 // The sink may still be flushing the tail; let it finish, then
                 // the gate inside finish_sink verifies the checksum. Only a
                 // verified transfer exits 0.
@@ -272,7 +271,7 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
 /// This is THE structural exit gate: `Ok(())` from here proves (a) every
 /// queued byte was written, (b) the digest of the bytes handed to the OS
 /// matches what the inlet announced, and (c) the writer exited cleanly.
-/// Successful transfers reach this through the `Done | PeerBye` arm, which
+/// Successful transfers reach this through the `Done` arm, which
 /// propagates any error - so exit 0 is impossible without a verified
 /// checksum. Error paths call this with `let _ =` to flush the valid prefix
 /// on the way out; their own error is the verdict that matters.
@@ -322,31 +321,64 @@ async fn session(
     signals: &mut mpsc::Receiver<i32>,
     ui: &Ui,
 ) -> Result<Session, Lost> {
-    let (send, recv) = conn.open_bi().await.map_err(|e| Lost(e.to_string()))?;
+    let (control_send, control_recv) = conn.open_bi().await.map_err(|e| Lost(e.to_string()))?;
 
-    let (to_inlet_tx, to_inlet_rx) = mpsc::channel::<OutletToInlet>(4);
-    let (from_inlet_tx, mut from_inlet_rx) = mpsc::channel::<InletToOutlet>(4);
+    let (to_inlet_tx, to_inlet_rx) = mpsc::channel::<OutletToInlet>(8);
+    let (from_inlet_tx, mut from_inlet_rx) = mpsc::channel::<InletToOutlet>(8);
     let (faults_tx, mut faults_rx) = mpsc::channel::<String>(2);
 
-    sink::pump(recv, sink.tx.clone(), from_inlet_tx, faults_tx.clone());
-    let writer = link::write_half(send, to_inlet_rx, faults_tx.clone());
+    link::read_half(control_recv, from_inlet_tx, faults_tx.clone());
+    let control_writer = link::write_half(control_send, to_inlet_rx, faults_tx.clone());
 
     // The greeting *is* the resume request: whatever we have written, that is
-    // where we want the inlet to start. The inlet answers with a `Fatal` if it
-    // can no longer reproduce those bytes, and `Data` otherwise.
+    // where we want the inlet to start. The inlet answers by opening the data
+    // stream, or with `Fatal` if it can no longer reproduce those bytes.
     let cursor = sink.cursor();
-    to_inlet_tx
-        .send(OutletToInlet::Received(cursor))
-        .await
-        .map_err(|_| Lost("inlet left immediately".into()))?;
+    if !send_ctrl(&to_inlet_tx, OutletToInlet::Written(cursor)).await {
+        return Err(Lost("inlet left immediately".into()));
+    }
     tracing::info!("connected; resuming at byte {cursor}");
+
+    let (data_end_tx, mut data_end_rx) = mpsc::channel::<()>(1);
+
+    // Wait for the inlet's data stream while remaining responsive to control
+    // frames: a rejected resume arrives as `Fatal` instead of a stream.
+    let data_recv = loop {
+        select! {
+            biased;
+
+            received_sig = signals.recv() => {
+                let sig = received_sig.unwrap_or(libc::SIGINT);
+                let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGINT).await;
+                return Ok(Session::Interrupted(sig));
+            }
+
+            Some(msg) = from_inlet_rx.recv() => match msg {
+                InletToOutlet::Checksum(sum) => *announced_checksum = Some(sum),
+                InletToOutlet::SIGINT => return Ok(Session::PeerCancelled),
+                InletToOutlet::Fatal(report) => return Ok(Session::Fatal(report)),
+            },
+
+            Some(fault) = faults_rx.recv() => return Err(Lost(fault)),
+            _ = conn.closed() => return Err(Lost("connection closed before data stream".into())),
+
+            accepted = conn.accept_uni() => match accepted {
+                Ok(recv) => break recv,
+                Err(e) => return Err(Lost(e.to_string())),
+            },
+        }
+    };
+
+    let data_pump = sink::pump(data_recv, sink.tx.clone(), data_end_tx, faults_tx.clone());
+    let mut data_finished = false;
+    let mut verify = false;
 
     let outcome: Result<Session, Lost> = 'session: loop {
         select! {
             biased;
 
-            // Local first, so Ctrl-C and a broken downstream are reported
-            // promptly even while the stream is saturated.
+            // Local first, so Ctrl-C is reported promptly even while the
+            // stream is saturated.
             received_sig = signals.recv() => {
                 // The producer's Ctrl-C must reach the inlet: the source dies
                 // of SIGINT, so this goodbye is its only way to learn. Awaited
@@ -357,121 +389,36 @@ async fn session(
                 break 'session Ok(Session::Interrupted(sig));
             }
 
-            // Peer control frames outrank sink acks: a continuously acking
-            // sink must never starve the inlet's SIGINT/EOF/Bye frames, or
-            // cancellation and the final handshake stall while the inlet's
-            // close destroys the unacked frame.
+            // Control frames outrank sink acks: a continuously acking sink
+            // must never starve the inlet's checksum or cancellation.
             Some(msg) = from_inlet_rx.recv() => match msg {
-                InletToOutlet::EOF => {
-                    ui.phase(Phase::Verifying);
-                    // Let the sink finish the tail. Deliberately *no* timeout:
-                    // a slow consumer is the downstream's own backpressure,
-                    // exactly as with an ordinary pipe, and exiting before the
-                    // tail is written would hang the inlet's window forever.
-                    // Instead the drain races the sink's own failure, so a
-                    // dead consumer surfaces here as SIGPIPE rather than
-                    // hanging the barrier.
-                    let final_offset = 'drain: loop {
-                        select! {
-                            biased;
-
-                            Some(f) = faults_rx.recv() => break 'session Err(Lost(f)),
-
-                            // Promptness over ack-forwarding: a late ack is
-                            // recoverable, a missed Ctrl-C or a dead
-                            // connection is not.
-                            received_sig = signals.recv() => {
-                                break 'session Ok(Session::Interrupted(
-                                    received_sig.unwrap_or(libc::SIGINT),
-                                ))
-                            }
-                            _ = conn.closed() => {
-                                break 'session Err(Lost(
-                                    "connection closed while draining the tail".into(),
-                                ))
-                            }
-
-                            Some(event) = events.recv() => match event {
-                                SinkEvent::BrokenPipe => {
-                                    // The consumer exited mid-tail. What it
-                                    // consumed is the true final count, and
-                                    // the producer upstream must get SIGPIPE.
-                                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::SIGPIPE).await;
-                                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await;
-                                    break 'session Ok(Session::BrokenPipe);
-                                }
-                                SinkEvent::Error(e) => break 'session Ok(Session::Fatal(e)),
-                                SinkEvent::Ack(n) => {
-                                    // A write during the drain advanced the
-                                    // cursor. The final `Received` below
-                                    // covers it, but forward late acks so the
-                                    // greeting of a reconnect stays truthful.
-                                    let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Received(n)).await;
-                                }
-                                // Impossible mid-tail: the inlet replays from
-                                // our cursor, so it can never start beyond it.
-                                SinkEvent::Gap { .. } => {}
-                            },
-
-                            verdict = sink::drain(sink, Duration::MAX) => break 'drain verdict,
-                        }
-                    };
-                    let Some((tail_end, written_digest)) = final_offset else {
-                        break 'session Ok(Session::Fatal(
-                            "sink stopped before the tail was written".into(),
-                        ));
-                    };
-
-                    // The goodbye is the inlet's only way to reach `Done`, so
-                    // it must be delivered: both frames are awaited, and a
-                    // failure breaks `Lost` instead of ending the session
-                    // silently. On reconnect the greeting restates the same
-                    // cursor, so the handshake converges.
-                    if !send_ctrl(&to_inlet_tx, OutletToInlet::Received(tail_end)).await {
-                        break 'session Err(Lost("could not deliver the final ack".into()));
-                    }
-                    if !send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await {
-                        break 'session Err(Lost("could not deliver the goodbye".into()));
-                    }
-
-                    // The integrity verdict: what the inlet's source produced
-                    // must equal what we handed to the OS. A mismatch means a
-                    // protocol bug corrupted the stream — never exit 0.
-                    let Some(expected) = *announced_checksum else {
-                        break 'session Ok(Session::Fatal(
-                            "the inlet sent EOF without a checksum".into(),
-                        ));
-                    };
-                    if expected != written_digest {
-                        break 'session Ok(Session::Fatal(format!(
-                            "checksum mismatch: the inlet sent {expected:#018x}, \
-                             we wrote {written_digest:#018x}: the stream is corrupt"
-                        )));
-                    }
-
-                    // All data is written and verified; `finish_sink` now
-                    // sends the sink's own EOF (flush + close) after its drain
-                    // barrier, so the writer thread is still alive to answer it.
-                    break 'session Ok(Session::Done);
-                }
                 InletToOutlet::Checksum(sum) => {
-                    // Arrives before EOF; the verdict is enforced there.
                     *announced_checksum = Some(sum);
+                    if data_finished {
+                        verify = true;
+                        break 'session Ok(Session::Done); // placeholder, finalize below
+                    }
                 }
                 InletToOutlet::SIGINT => break 'session Ok(Session::PeerCancelled),
                 InletToOutlet::Fatal(report) => break 'session Ok(Session::Fatal(report)),
-                InletToOutlet::Bye => break 'session Ok(Session::PeerBye),
-                InletToOutlet::Data { .. } => {
-                    break 'session Err(Lost("data frame reached the session".into()))
-                }
             },
+
+            Some(()) = data_end_rx.recv() => {
+                data_finished = true;
+                ui.phase(Phase::Verifying);
+                if announced_checksum.is_some() {
+                    verify = true;
+                    break 'session Ok(Session::Done); // placeholder, finalize below
+                }
+            }
 
             Some(event) = events.recv() => match event {
                 SinkEvent::Ack(n) => {
                     // try_send on purpose: a dropped ack is superseded by the
                     // next one, and the greeting on the next connection.
-                    let _ = to_inlet_tx.try_send(OutletToInlet::Received(n));
-                }                SinkEvent::BrokenPipe => {
+                    let _ = to_inlet_tx.try_send(OutletToInlet::Written(n));
+                }
+                SinkEvent::BrokenPipe => {
                     // Our consumer is gone. Tell the inlet so its producer dies
                     // too, then die like a pipe ourselves. Both frames are
                     // awaited (bounded): this goodbye is the producer's only
@@ -481,12 +428,6 @@ async fn session(
                     let _ = send_ctrl(&to_inlet_tx, OutletToInlet::Bye).await;
                     break 'session Ok(Session::BrokenPipe);
                 }
-                SinkEvent::Gap { expected, got } => {
-                    break 'session Ok(Session::Fatal(format!(
-                        "inlet started at byte {got} but we had written {expected}: \
-                         bytes are missing from the stream"
-                    )));
-                }
                 SinkEvent::Error(e) => break 'session Ok(Session::Fatal(e)),
             },
 
@@ -495,21 +436,53 @@ async fn session(
         }
     };
 
+    // No new data may enter the queue after this point: a reconnect drain must
+    // observe a fixed sink queue before taking its cursor. A *graceful* verdict
+    // (cancel, broken pipe, fatal) is delivered on the control stream, so the
+    // data stream is left alone: resetting it here would race the control frame
+    // and could turn a clean cancellation into a spurious "lost connection".
+    // It ends by itself when the connection closes.
+    if outcome.is_err() {
+        data_pump.abort();
+    }
+
+    // Finalize first: it sends the last `Written` and the `Bye`, so the
+    // control sender (and the writer draining it) must still be alive.
+    let verdict = if verify {
+        finalize(
+            sink,
+            events,
+            *announced_checksum,
+            signals,
+            &to_inlet_tx,
+            conn,
+        )
+        .await
+    } else {
+        outcome
+    };
+
+    // Only now wind the control stream down: dropping the sender lets the
+    // writer finish the stream (FIN), so the inlet sees a clean end of control.
     drop(to_inlet_tx);
-    let _ = timeout(Duration::from_secs(3), writer).await;
+    if verdict.is_err() {
+        control_writer.abort();
+    } else {
+        let _ = timeout(Duration::from_secs(3), control_writer).await;
+    }
 
     // Announce the verdict at the transport level. For cancellation the
     // connection must NOT be closed right away: `close` discards stream data
     // that has not been acked, which could destroy the in-flight SIGINT frame.
     // Wait for the peer to close back first; close as a backstop otherwise.
-    match &outcome {
+    match &verdict {
         Ok(Session::Interrupted(_)) => {
             if timeout(PEER_CLOSE_GRACE, conn.closed()).await.is_err() {
                 net::close_intentional(conn, net::close::CANCEL, "SIGINT");
                 tokio::time::sleep(net::CLOSE_PROPAGATE).await;
             }
         }
-        Ok(Session::Done | Session::PeerBye) => {
+        Ok(Session::Done) => {
             net::close_intentional(conn, net::close::DONE, "done");
             tokio::time::sleep(net::CLOSE_PROPAGATE).await;
         }
@@ -527,5 +500,84 @@ async fn session(
         }
         Err(Lost(_)) => {} // the connection is already gone
     }
-    outcome
+    verdict
+}
+
+/// Called once the data stream FIN and the checksum are both in hand. Drains
+/// the sink, reports the true final cursor, verifies the digest and says
+/// goodbye. It stays responsive to Ctrl-C and a dead consumer.
+async fn finalize(
+    sink: &Sink,
+    events: &mut mpsc::Receiver<SinkEvent>,
+    announced_checksum: Option<u64>,
+    signals: &mut mpsc::Receiver<i32>,
+    to_inlet_tx: &mpsc::Sender<OutletToInlet>,
+    conn: &Connection,
+) -> Result<Session, Lost> {
+    let final_offset = 'drain: loop {
+        select! {
+            biased;
+
+            received_sig = signals.recv() => {
+                return Ok(Session::Interrupted(received_sig.unwrap_or(libc::SIGINT)));
+            }
+            _ = conn.closed() => {
+                return Err(Lost("connection closed while draining the tail".into()));
+            }
+
+            Some(event) = events.recv() => match event {
+                SinkEvent::BrokenPipe => {
+                    let _ = send_ctrl(to_inlet_tx, OutletToInlet::SIGPIPE).await;
+                    let _ = send_ctrl(to_inlet_tx, OutletToInlet::Bye).await;
+                    return Ok(Session::BrokenPipe);
+                }
+                SinkEvent::Error(e) => return Ok(Session::Fatal(e)),
+                SinkEvent::Ack(n) => {
+                    // A write during the drain advanced the cursor. The final
+                    // `Written` below covers it, but forward late acks so the
+                    // greeting of a reconnect stays truthful.
+                    let _ = send_ctrl(to_inlet_tx, OutletToInlet::Written(n)).await;
+                }
+            },
+
+            verdict = sink::drain(sink, Duration::MAX) => break 'drain verdict,
+        }
+    };
+
+    let Some((tail_end, written_digest)) = final_offset else {
+        return Ok(Session::Fatal(
+            "sink stopped before the tail was written".into(),
+        ));
+    };
+
+    // The goodbye is the inlet's only way to reach success, so it must be
+    // delivered: both frames are awaited, and a failure becomes `Lost` instead
+    // of ending the session silently. On reconnect the greeting restates the
+    // same cursor, so the handshake converges.
+    if !send_ctrl(to_inlet_tx, OutletToInlet::Written(tail_end)).await {
+        return Err(Lost("could not deliver the final ack".into()));
+    }
+    if !send_ctrl(to_inlet_tx, OutletToInlet::Bye).await {
+        return Err(Lost("could not deliver the goodbye".into()));
+    }
+
+    // The integrity verdict: what the inlet's source produced must equal what
+    // we handed to the OS. A mismatch means a protocol bug corrupted the
+    // stream — never exit 0.
+    let Some(expected) = announced_checksum else {
+        return Ok(Session::Fatal(
+            "the inlet sent EOF without a checksum".into(),
+        ));
+    };
+    if expected != written_digest {
+        return Ok(Session::Fatal(format!(
+            "checksum mismatch: the inlet sent {expected:#018x}, \
+             we wrote {written_digest:#018x}: the stream is corrupt"
+        )));
+    }
+
+    // All data is written and verified; `finish_sink` now sends the sink's own
+    // EOF (flush + close) after its drain barrier, so the writer thread is
+    // still alive to answer it.
+    Ok(Session::Done)
 }

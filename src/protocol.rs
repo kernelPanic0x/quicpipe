@@ -5,10 +5,9 @@ use bytes::{Bytes, BytesMut};
 use tokio_util::codec::{Decoder, LengthDelimitedCodec};
 use wincode::{Deserialize, SchemaRead, SchemaWrite, Serialize};
 
-/// 256 KiB: small enough that slow links see the progress bar move every
-/// second or two, large enough that framing, allocation and ack traffic stay
-/// negligible at high throughput.
-pub const CHUNK_SIZE: usize = 256 * 1024;
+/// Control messages are tiny (a cursor, a digest, a short failure reason).
+/// Bulk bytes travel on a separate unframed stream.
+pub const CONTROL_MAX_FRAME: usize = 64 * 1024;
 pub const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024; // 16 MiB max in-memory window
 /// Manual protocol version, bumped only when the wire format changes —
 /// deliberately NOT tied to the crate version, so patch releases stay
@@ -49,8 +48,7 @@ pub struct WireCodec<T> {
 impl<T> WireCodec<T> {
     pub fn new() -> Self {
         let framing = LengthDelimitedCodec::builder()
-            // A chunk plus the enum tag and the payload length prefix.
-            .max_frame_length(CHUNK_SIZE + 4096)
+            .max_frame_length(CONTROL_MAX_FRAME)
             .new_codec();
         Self {
             framing,
@@ -89,25 +87,18 @@ impl<T: Encoder> Decoder for WireCodec<T> {
 #[derive(SchemaWrite, SchemaRead, Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum InletToOutlet {
-    /// A slice of the byte stream, tagged with its absolute offset so a replayed
-    /// chunk is recognised rather than written twice.
-    Data {
-        offset: u64,
-        payload: Bytes,
-    },
-    EOF,
     /// End-to-end integrity verdict: the XXH3-64 digest of everything the
-    /// inlet's source produced, sent just before EOF. The outlet compares it
-    /// against the hash of the bytes it actually wrote; any mismatch — a
-    /// skipped or duplicated chunk, a bad resume, anything the framing alone
-    /// could not see — fails the transfer loudly.
+    /// inlet's source produced. It travels on the control stream; the raw data
+    /// stream ends with FIN. The outlet compares the digest against the hash of
+    /// the bytes it actually wrote; any mismatch — a skipped or duplicated
+    /// byte, a bad resume, anything QUIC's per-stream ordering could not see
+    /// across a reconnect — fails the transfer loudly.
     Checksum(u64),
     /// Ctrl+C
     SIGINT,
     /// Unrecoverable: a source read failure, a protocol violation, or a resume
     /// request that fell outside the replay window. The pipe is over.
     Fatal(String),
-    Bye,
 }
 
 #[allow(clippy::upper_case_acronyms)]
@@ -115,9 +106,9 @@ pub enum InletToOutlet {
 pub enum OutletToInlet {
     /// "Everything below this offset has been written to stdout."
     ///
-    /// Sent after each write, and as the first frame of every connection — where
+    /// Sent after writes, and as the first frame of every connection — where
     /// it is exactly the resume request. Same meaning, so it is the same frame.
-    Received(u64),
+    Written(u64),
     /// Ctrl+C
     SIGINT,
     /// The outlet's stdout is gone; the producer upstream should get SIGPIPE.

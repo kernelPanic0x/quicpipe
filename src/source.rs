@@ -14,7 +14,11 @@ use std::thread;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::protocol::CHUNK_SIZE;
+/// Read granularity on the producer side. This is no longer a wire frame
+/// size: bytes leave the process on a raw stream, so this only controls
+/// how often the blocking source thread wakes and how the replay window is
+/// chunked.
+pub const READ_SIZE: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub enum Msg {
@@ -55,7 +59,7 @@ pub fn spawn(path: &Path, capacity: usize) -> std::io::Result<Source> {
             // (True zero-copy via `Read::read_buf` is still unstable, and the
             // `chunk_mut`/raw-pointer pattern is not worth an `unsafe` for
             // ~0.03% of the transfer's time budget.)
-            let mut buf = vec![0u8; CHUNK_SIZE];
+            let mut buf = vec![0u8; READ_SIZE];
             loop {
                 match input.read(&mut buf) {
                     Ok(0) => {
@@ -97,7 +101,7 @@ mod source_tests {
     async fn reads_a_file_completely_and_in_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("in.bin");
-        let payload: Vec<u8> = (0..(CHUNK_SIZE * 2 + 1234)).map(|i| (i % 251) as u8).collect();
+        let payload: Vec<u8> = (0..(READ_SIZE * 2 + 1234)).map(|i| (i % 251) as u8).collect();
         std::fs::write(&path, &payload).expect("write");
 
         let mut source = spawn(&path, 4).expect("spawn");
