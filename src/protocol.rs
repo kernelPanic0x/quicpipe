@@ -5,7 +5,10 @@ use bytes::{Bytes, BytesMut};
 use tokio_util::codec::{Decoder, LengthDelimitedCodec};
 use wincode::{Deserialize, SchemaRead, SchemaWrite, Serialize};
 
-pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
+/// 256 KiB: small enough that slow links see the progress bar move every
+/// second or two, large enough that framing, allocation and ack traffic stay
+/// negligible at high throughput.
+pub const CHUNK_SIZE: usize = 256 * 1024;
 pub const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024; // 16 MiB max in-memory window
 /// Manual protocol version, bumped only when the wire format changes —
 /// deliberately NOT tied to the crate version, so patch releases stay
