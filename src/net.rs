@@ -17,7 +17,15 @@ use crate::signals::Termination;
 
 /// How long to wait for a connection to reveal *why* it ended when a stream
 /// task failed before the connection itself reported anything.
-pub const CLOSE_REVEAL: std::time::Duration = std::time::Duration::from_secs(1);
+///
+/// This must outlast the peer's cancellation choreography: a cancelling side
+/// queues its `Cancel` frame, then waits `PEER_CLOSE_GRACE` (3s) for us to
+/// close back before it sends its own `CONNECTION_CLOSE`. A stream fault (for
+/// example `STOP_SENDING` when the peer tears the data stream down) can fire
+/// before the control frame or close code arrives, so giving up after 1s made
+/// the difference between "the peer cancelled" and "the connection is lost"
+/// a coin flip.
+pub const CLOSE_REVEAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long to linger after an intentional `close` so the `CONNECTION_CLOSE`
 /// frame reaches the peer before the endpoint (or the whole process) goes away.
