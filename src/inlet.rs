@@ -112,12 +112,20 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
             Err(Lost(reason)) => {
                 ui.clear_connection();
                 // A lost connection is only worth waiting on if the peer did
-                // not leave on purpose: its close code is the definitive
-                // verdict, surviving even a lost in-band control frame.
+                // not leave on purpose. Non-success close codes are definitive
+                // even when the matching in-band frame was lost; success still
+                // requires the in-band `Bye` (see the DONE arm).
                 match net::close_kind(&conn).await {
-                    net::CloseKind::App(net::close::DONE, _) => {
-                        ui.finish_success();
-                        return Ok(());
+                    net::CloseKind::App(net::close::DONE, r) => {
+                        // Only the in-band `Bye` proves that the outlet
+                        // verified our checksum. A `DONE` close arriving
+                        // without it may be a spurious/transport-level close:
+                        // never turn that into success. This mirrors the
+                        // outlet's refusal to trust `DONE` without `Checksum`.
+                        return Err(eyre!(
+                            "outlet closed with 'done' but never said Bye: \
+                             the transfer may be incomplete ({r})"
+                        ));
                     }
                     net::CloseKind::App(net::close::CANCELLED, _) => signals::exit(Termination::Interrupt),
                     net::CloseKind::App(net::close::CONSUMER_GONE, _) => signals::exit(Termination::ConsumerGone),

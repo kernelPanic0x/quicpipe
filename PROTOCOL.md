@@ -110,6 +110,12 @@ frames, because a close frame can be lost together with stream data.
 Any other application code is not a verdict this version understands, and is
 reported as a failed transfer rather than treated as success.
 
+`DONE` corroborates `Bye`; it is not success on its own. An inlet that
+observes the close without having received `Bye` must report a failure. The
+outlet applies the symmetric rule towards `Checksum`. This keeps "exit zero"
+tied to evidence that both sides actually completed, rather than to a close
+code that a transport teardown could produce by accident.
+
 ## Deliberately not in v1
 
 - **Source identity.** A changed source between reconnects is caught only by
