@@ -54,6 +54,9 @@ enum Session {
     /// Our downstream consumer is gone; the inlet must stop too.
     ConsumerGone,
     Fatal(String),
+    /// No frame from the inlet for `net::STALL_TIMEOUT`: this connection is up
+    /// but not carrying anything. Not a verdict — the transfer is untouched.
+    Stalled(String),
 }
 
 struct Lost(String);
@@ -221,6 +224,19 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                 tracing::error!("{msg}");
                 return Err(color_eyre::eyre::eyre!(msg));
             }
+            Ok(Session::Stalled(reason)) => {
+                lost_attempts += 1;
+                ui.clear_connection();
+                ui.phase(Phase::Reconnecting {
+                    attempt: lost_attempts,
+                });
+                tracing::warn!("{reason}; reconnecting");
+                if let Some(why) =
+                    net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
+                {
+                    signals::exit(why);
+                }
+            }
             Err(Lost(reason)) => {
                 lost_attempts += 1;
                 ui.clear_connection();
@@ -275,6 +291,19 @@ async fn outlet_session(endpoint: &Endpoint, key: &SecretKey, mut args: OutletAr
                             "inlet closed the connection unexpectedly ({r}); \
                              the stream is incomplete"
                         ));
+                    }
+                    net::CloseKind::Stalled(r) => {
+                        // The inlet's watchdog dropped a connection that had
+                        // stopped carrying frames. Not a cancellation: resume.
+                        ui.phase(Phase::Reconnecting {
+                            attempt: lost_attempts,
+                        });
+                        tracing::warn!("inlet stalled on its side ({r}); reconnecting");
+                        if let Some(why) =
+                            net::wait_for_retry(net::backoff(lost_attempts), &mut signal_rx).await
+                        {
+                            signals::exit(why);
+                        }
                     }
                     net::CloseKind::TimedOut => {
                         // Only an ordinary network failure may be retried.
@@ -443,6 +472,17 @@ async fn session(
     }
     tracing::info!("connected; resuming at byte {cursor}");
 
+    // Liveness. Frames arriving at all refresh `last_frame` — including the
+    // inlet's `Alive` pings, which it sends even while its source is idle — and
+    // this side restates its own liveness with a repeated `Written` (a cursor
+    // that did not move carries no information, by design). Silence on both
+    // counts for `STALL_TIMEOUT` therefore means the connection is not carrying
+    // frames, not that there is nothing to send.
+    let mut last_frame = tokio::time::Instant::now();
+    let mut alive = tokio::time::interval(net::ALIVE_INTERVAL);
+    alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    alive.tick().await; // the first tick is immediate
+
     let (data_end_tx, mut data_end_rx) = mpsc::channel::<()>(1);
 
     // Wait for the inlet's data stream while remaining responsive to control
@@ -461,6 +501,7 @@ async fn session(
             }
 
             Some(event) = inbound_rx.recv() => match event {
+                link::Inbound::Frame(InletToOutlet::Alive) => {}
                 link::Inbound::Frame(InletToOutlet::End(end)) => *announced = Some(end),
                 link::Inbound::Frame(InletToOutlet::Cancel) => return Ok(Session::PeerCancelled),
                 link::Inbound::Frame(InletToOutlet::Fatal(report)) => {
@@ -504,22 +545,47 @@ async fn session(
 
             // Control frames outrank sink acks: a continuously acking sink
             // must never starve the inlet's end-of-source or cancellation.
-            Some(event) = inbound_rx.recv() => match event {
-                link::Inbound::Frame(InletToOutlet::End(end)) => {
-                    *announced = Some(end);
-                    if data_finished {
-                        verify = true;
-                        break 'session Ok(Session::Done { acknowledged: false }); // placeholder, finalize below
+            Some(event) = inbound_rx.recv() => {
+                // Any frame at all, including a liveness ping, proves the
+                // connection is still carrying frames.
+                last_frame = tokio::time::Instant::now();
+                match event {
+                    // Nothing to report: the inlet is alive, that is all.
+                    link::Inbound::Frame(InletToOutlet::Alive) => {}
+                    link::Inbound::Frame(InletToOutlet::End(end)) => {
+                        *announced = Some(end);
+                        if data_finished {
+                            verify = true;
+                            break 'session Ok(Session::Done { acknowledged: false }); // placeholder, finalize below
+                        }
                     }
+                    link::Inbound::Frame(InletToOutlet::Cancel) => {
+                        break 'session Ok(Session::PeerCancelled);
+                    }
+                    link::Inbound::Frame(InletToOutlet::Fatal(report)) => {
+                        break 'session Ok(Session::Fatal(report));
+                    }
+                    link::Inbound::Fault(fault) => break 'session Err(Lost(fault)),
                 }
-                link::Inbound::Frame(InletToOutlet::Cancel) => {
-                    break 'session Ok(Session::PeerCancelled);
-                }
-                link::Inbound::Frame(InletToOutlet::Fatal(report)) => {
-                    break 'session Ok(Session::Fatal(report));
-                }
-                link::Inbound::Fault(fault) => break 'session Err(Lost(fault)),
             },
+
+            // Liveness ping. A repeated `Written` is harmless: the inlet's
+            // window ignores stale acks, so this says "still here" without
+            // claiming anything new.
+            _ = alive.tick() => {
+                let _ = to_inlet_tx.try_send(OutletToInlet::Written(sink.cursor()));
+            }
+
+            // The inlet has said nothing at all for `STALL_TIMEOUT`, although
+            // it pings whenever it is alive. Tear this connection down and
+            // redial: the replay window makes that lossless, so a false
+            // positive costs one reconnect while waiting costs the transfer.
+            () = tokio::time::sleep_until(last_frame + net::STALL_TIMEOUT) => {
+                break 'session Ok(Session::Stalled(format!(
+                    "no frame from the inlet for {:?}",
+                    net::STALL_TIMEOUT
+                )));
+            }
 
             // The data stream's FIN corroborates `End.total`: it says "no more
             // bytes are coming". Both facts are required, and neither is
@@ -561,7 +627,7 @@ async fn session(
     // data stream is left alone: resetting it here would race the control frame
     // and could turn a clean cancellation into a spurious "lost connection".
     // It ends by itself when the connection closes.
-    if outcome.is_err() {
+    if outcome.is_err() || matches!(outcome, Ok(Session::Stalled(_))) {
         data_pump.abort();
     }
 
@@ -634,6 +700,12 @@ async fn session(
             net::close_intentional(conn, net::close::FATAL, &msg[..msg.len().min(256)]);
             tokio::time::sleep(net::CLOSE_PROPAGATE).await;
         }
+        Ok(Session::Stalled(reason)) => {
+            // A transport verdict, not a cancellation: drop the connection,
+            // not the transfer. The close code says which one this is.
+            net::close_intentional(conn, net::close::STALLED, &reason[..reason.len().min(256)]);
+            tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+        }
         // The first pattern is unreachable from here: only the branch above
         // ever sets the flag, and it returns. Kept for exhaustiveness.
         Ok(Session::Done { acknowledged: true }) | Err(Lost(_)) => {}
@@ -652,6 +724,16 @@ async fn finalize(
     to_inlet_tx: &mpsc::Sender<OutletToInlet>,
     conn: &Connection,
 ) -> Result<Session, Lost> {
+    // The inlet is still waiting for our `Bye` while this drain runs, and its
+    // watchdog is armed: a slow sink can take longer than `STALL_TIMEOUT` to
+    // flush the tail, so keep the liveness pings going until the verdict is in
+    // hand. Without this a slow destination would look exactly like a dead
+    // connection to the inlet, and it would drop a transfer that is about to
+    // succeed.
+    let mut alive = tokio::time::interval(net::ALIVE_INTERVAL);
+    alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    alive.tick().await; // the first tick is immediate
+
     let final_offset = 'drain: loop {
         select! {
             biased;
@@ -681,6 +763,12 @@ async fn finalize(
                     let _ = send_ctrl(to_inlet_tx, OutletToInlet::Written(n)).await;
                 }
             },
+
+            // Still here, still draining: the same liveness ping as in the
+            // session loop, and for the same reason.
+            _ = alive.tick() => {
+                let _ = to_inlet_tx.try_send(OutletToInlet::Written(sink.cursor()));
+            }
 
             verdict = sink::drain(sink, Duration::MAX) => break 'drain verdict,
         }

@@ -114,6 +114,19 @@ pub enum InletToOutlet {
     /// request that fell outside the replay window. The transfer is over.
     #[wincode(tag = 2)]
     Fatal(String),
+    /// "I am still here, there is simply nothing to say right now". Sent every
+    /// `net::ALIVE_INTERVAL` while a transfer is in
+    /// flight, including while the source is idle or the writer is blocked.
+    ///
+    /// It carries no state at all; its only job is to make silence mean
+    /// something. Without it a connection that is up but no longer carrying
+    /// data (a migrated path that never passes traffic, a peer that stopped
+    /// being scheduled) is indistinguishable from a peer with nothing to send,
+    /// and QUIC's idle timeout never fires because keep-alives keep the
+    /// connection alive. The outlet's watchdog treats `STALL_TIMEOUT` of
+    /// silence as "this connection is dead, rebuild it".
+    #[wincode(tag = 3)]
+    Alive,
 }
 
 #[derive(SchemaWrite, SchemaRead, Debug, Clone)]
@@ -174,6 +187,8 @@ mod tests {
             tag(&InletToOutlet::Fatal("x".into()).encode().unwrap()),
             [2, 0, 0, 0]
         );
+
+        assert_eq!(tag(&InletToOutlet::Alive.encode().unwrap()), [3, 0, 0, 0]);
 
         assert_eq!(tag(&OutletToInlet::Written(7).encode().unwrap()), [0, 0, 0, 0]);
         assert_eq!(tag(&OutletToInlet::Cancel.encode().unwrap()), [1, 0, 0, 0]);

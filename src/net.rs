@@ -46,6 +46,10 @@ pub mod close {
     pub const CONSUMER_GONE: u64 = 2;
     /// Unrecoverable error on the closing side.
     pub const FATAL: u64 = 3;
+    /// No application progress and no liveness frame for [`STALL_TIMEOUT`]:
+    /// this side is giving up on *this connection*, not on the transfer.
+    /// Retryable, exactly like an idle timeout — resume is exact.
+    pub const STALLED: u64 = 4;
 }
 
 /// How the connection ended, classified for the reconnect policy.
@@ -55,6 +59,11 @@ pub enum CloseKind {
     App(u64, String),
     /// Idle timeout — the ordinary network failure, safe to retry.
     TimedOut,
+    /// The peer's watchdog gave up on a connection that was up but not moving
+    /// data (a migrated path that never carried traffic, a wedged peer, a
+    /// process that stopped being scheduled). Retryable like `TimedOut`: the
+    /// transfer was not cancelled, this connection was.
+    Stalled(String),
     /// Anything else: transport error, reset, or a local stream failure.
     Lost(String),
 }
@@ -82,6 +91,11 @@ pub async fn close_kind(conn: &Connection) -> CloseKind {
 
 fn classify(err: ConnectionError) -> CloseKind {
     match err {
+        // The watchdog's own code first: "this connection is dead" is not a
+        // verdict, so it must not be filed with the final application closes.
+        ConnectionError::ApplicationClosed(c) if c.error_code.into_inner() == close::STALLED => {
+            CloseKind::Stalled(String::from_utf8_lossy(&c.reason).into_owned())
+        }
         ConnectionError::ApplicationClosed(c) => CloseKind::App(
             c.error_code.into_inner(),
             String::from_utf8_lossy(&c.reason).into_owned(),
@@ -90,6 +104,24 @@ fn classify(err: ConnectionError) -> CloseKind {
         other => CloseKind::Lost(other.to_string()),
     }
 }
+
+/// How often each side restates its liveness while a transfer is in flight: a
+/// repeated `Written` (its cursor unchanged) from the outlet, an `Alive` frame
+/// from the inlet. These carry no information; they exist so that silence means
+/// something. QUIC's own keep-alives cannot do this job: they keep the
+/// connection *up*, which is exactly why a connection that is up but not
+/// carrying data never trips the idle timeout.
+pub const ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a live connection may go without a single frame from the peer
+/// before the local watchdog drops it and lets the reconnect loop rebuild it.
+///
+/// Three `ALIVE_INTERVAL`s: two lost pings are a blip, three is a stall. This
+/// is a bound on *this connection*, never a verdict: the replay window plus the
+/// barrier-before-dial make a reconnect lossless, so the cost of firing
+/// spuriously is one reconnect, while the cost of not firing is the transfer
+/// hanging forever on a path that will never carry it.
+pub const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long to wait for the peer to confirm it received a finished stream. A
 /// `Bye` or `Fatal` still in flight must not be discarded by teardown.
@@ -184,4 +216,40 @@ pub fn backoff(attempt: u32) -> std::time::Duration {
         .map_or(0, |d| u64::from(d.subsec_millis()))
         % (base / 2 + 1);
     std::time::Duration::from_millis(base / 2 + jitter)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use iroh::endpoint::{ApplicationClose, VarInt};
+
+    fn closed_with(code: u64) -> ConnectionError {
+        ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: VarInt::from_u64(code).unwrap(),
+            reason: "test".into(),
+        })
+    }
+
+    /// The watchdog's code means "this connection is dead", not "the transfer
+    /// is over". Filing it with the final application closes would make both
+    /// sides treat a stall as a verdict — the outlet would exit non-zero for a
+    /// transfer that a reconnect fixes a second later (`code 4` falls into the
+    /// "unexpected close" arm), and the inlet would give up on the producer.
+    #[test]
+    fn a_stalled_connection_is_retryable_not_a_verdict() {
+        assert!(matches!(
+            classify(closed_with(close::STALLED)),
+            CloseKind::Stalled(_)
+        ));
+        assert!(matches!(
+            classify(closed_with(close::DONE)),
+            CloseKind::App(close::DONE, _)
+        ));
+        assert!(matches!(
+            classify(closed_with(close::CANCELLED)),
+            CloseKind::App(close::CANCELLED, _)
+        ));
+    }
 }

@@ -59,6 +59,7 @@ Inlet → outlet:
 | 0   | `End(SourceEnd)`  | the source ended: its exact `total` and its XXH3-64 `checksum`; sent once per connection when the source is exhausted |
 | 1   | `Cancel`          | this side is ending the transfer at the user's request          |
 | 2   | `Fatal(String)`   | unrecoverable error (source read failure, protocol violation, resume outside the replay window) |
+| 3   | `Alive`           | liveness only: "I am here, there is nothing to say". Sent every 5 s while a transfer is in flight, including while the source is idle or a writer is blocked |
 
 Outlet → inlet:
 
@@ -73,6 +74,30 @@ Outlet → inlet:
 sends on a new connection is `Written(cursor)`, where `cursor` is exactly the
 number of bytes already handed to the destination. That single frame is the
 whole resume handshake.
+
+### Liveness
+
+Silence has to mean something, so both directions restate that they are alive
+every 5 s while a transfer is in flight:
+
+- the inlet sends `Alive`;
+- the outlet sends `Written(cursor)` again, with an unchanged cursor. This is
+  truthful ("this much is written") and idempotent: a stale ack is ignored by
+  the replay window, so a repeat carries no information and needs no new frame.
+
+Both frames are *ignored* by the receiver except as proof that the connection
+is still carrying frames. If no frame at all arrives for 15 s, the local
+watchdog **drops the connection** (close code `STALLED`) and reconnects. It
+never concludes anything about the transfer.
+
+QUIC's own keep-alives cannot do this job, and in fact prevent it: they keep
+the connection *up*, so a connection that is up but no longer carrying data —
+a migrated path that never passes traffic, a peer that stopped being scheduled,
+a process that is `SIGSTOP`ped — never trips the idle timeout. Without the
+liveness frames both sides would wait forever on a connection that will never
+carry another byte. The watchdog is armed only while a transfer is in flight,
+and it stays armed during a slow-sink drain because the inlet is still waiting
+for `Bye`: a slow destination must not look like a dead connection.
 
 ## Resume contract
 
@@ -196,9 +221,15 @@ structural defence is that neither is a verdict by itself.
 | 1    | `CANCELLED`     | ended at the user's request                     |
 | 2    | `CONSUMER_GONE` | the outlet's output consumer exited             |
 | 3    | `FATAL`         | unrecoverable error; reason string says why     |
+| 4    | `STALLED`       | this *connection* is being dropped: no frame from the peer for 15 s |
 
 Any other application code is not a verdict this version understands, and is
 reported as a failed transfer rather than treated as success.
+
+`STALLED` is the one code that is **retryable**, and it must be classified
+before the "unexpected application close" rule: it means "rebuild the
+connection", never "the transfer is over". Both sides treat it exactly like an
+idle timeout — reconnect, resume from the barrier-drained cursor.
 
 `DONE` corroborates `Bye`; it is not success on its own. An inlet that
 observes the close without having received `Bye` must report a failure. The

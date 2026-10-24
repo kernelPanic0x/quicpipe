@@ -36,6 +36,10 @@ enum Session {
     /// The outlet's downstream consumer is gone, so ours must stop too.
     ConsumerGone,
     Fatal(String),
+    /// This connection stopped carrying anything (no frame from the outlet for
+    /// `net::STALL_TIMEOUT`). Not a verdict: the transfer is untouched, so the
+    /// accept loop simply waits for the outlet to dial again.
+    Stalled(String),
 }
 
 /// "The connection went away" — the one thing worth retrying.
@@ -109,6 +113,12 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
             Ok(Session::Cancelled(why)) => signals::exit(why),
             Ok(Session::ConsumerGone) => signals::exit(Termination::ConsumerGone),
             Ok(Session::Fatal(msg)) => return Err(eyre!(msg)),
+            Ok(Session::Stalled(reason)) => {
+                attempt = attempt.saturating_add(1);
+                ui.clear_connection();
+                ui.phase(Phase::Reconnecting { attempt });
+                tracing::warn!("{reason}; waiting for a reconnect");
+            }
             Err(Lost(reason)) => {
                 ui.clear_connection();
                 // A lost connection is only worth waiting on if the peer did
@@ -144,6 +154,13 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
                             "outlet closed the connection unexpectedly ({code}: {r}); \
                              the stream is incomplete"
                         ));
+                    }
+                    // A stalled peer shut this connection down, not the
+                    // transfer: retry exactly like a network loss.
+                    net::CloseKind::Stalled(r) => {
+                        attempt = attempt.saturating_add(1);
+                        ui.phase(Phase::Reconnecting { attempt });
+                        tracing::warn!("connection stalled ({r}); waiting for a reconnect");
                     }
                     net::CloseKind::TimedOut | net::CloseKind::Lost(_) => {
                         attempt = attempt.saturating_add(1);
@@ -313,6 +330,14 @@ async fn session(
     let mut data_closed = false;
     let mut end_sent = false;
 
+    // Liveness. Every branch that receives a frame refreshes `last_frame`, and
+    // this side restates its own liveness on a timer, so both directions can
+    // tell "nothing to say" from "nothing is arriving".
+    let mut last_frame = tokio::time::Instant::now();
+    let mut alive = tokio::time::interval(net::ALIVE_INTERVAL);
+    alive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    alive.tick().await; // the first tick is immediate
+
     tracing::info!(
         "outlet connected; resuming from byte {resume_from} \
          ({} chunks buffered, {} unacknowledged)",
@@ -361,22 +386,46 @@ async fn session(
             // Frames and stream failures share one channel and arrive in the
             // order they happened, so a fault can never preempt a verdict the
             // peer already sent (a `Bye` queued while the control read dies).
-            Some(event) = inbound_rx.recv() => match event {
-                link::Inbound::Frame(OutletToInlet::Written(n)) => {
-                    window.ack(n);
-                    position.fetch_max(n, Ordering::Relaxed);
+            Some(event) = inbound_rx.recv() => {
+                // Any frame at all, including a repeated ack, proves the
+                // connection is still carrying frames.
+                last_frame = tokio::time::Instant::now();
+                match event {
+                    link::Inbound::Frame(OutletToInlet::Written(n)) => {
+                        window.ack(n);
+                        position.fetch_max(n, Ordering::Relaxed);
+                    }
+                    link::Inbound::Frame(OutletToInlet::Bye) => {
+                        break 'session Ok(Session::PeerBye);
+                    }
+                    link::Inbound::Frame(OutletToInlet::Cancel) => {
+                        break 'session Ok(Session::Cancelled(Termination::Interrupt));
+                    }
+                    link::Inbound::Frame(OutletToInlet::ConsumerGone) => {
+                        break 'session Ok(Session::ConsumerGone);
+                    }
+                    // A stream task died: the transport is gone, nothing more.
+                    // The caller decides whether that is worth reconnecting.
+                    link::Inbound::Fault(fault) => break 'session Err(Lost(fault)),
                 }
-                link::Inbound::Frame(OutletToInlet::Bye) => break 'session Ok(Session::PeerBye),
-                link::Inbound::Frame(OutletToInlet::Cancel) => {
-                    break 'session Ok(Session::Cancelled(Termination::Interrupt));
-                }
-                link::Inbound::Frame(OutletToInlet::ConsumerGone) => {
-                    break 'session Ok(Session::ConsumerGone);
-                }
-                // A stream task died: the transport is gone, nothing more. The
-                // caller decides whether that is worth reconnecting.
-                link::Inbound::Fault(fault) => break 'session Err(Lost(fault)),
             },
+
+            // Liveness ping: nothing to report, everything is fine.
+            _ = alive.tick() => {
+                let _ = to_outlet_tx.try_send(InletToOutlet::Alive);
+            }
+
+            // The outlet has said nothing at all for `STALL_TIMEOUT`. If it
+            // were merely slow it would still be pinging `Written` (its cursor
+            // unchanged), so this connection is not carrying frames any more.
+            // Drop it and let both sides rebuild: resume is exact, so a false
+            // positive costs one reconnect, while waiting costs the transfer.
+            () = tokio::time::sleep_until(last_frame + net::STALL_TIMEOUT) => {
+                break 'session Ok(Session::Stalled(format!(
+                    "no frame from the outlet for {:?}",
+                    net::STALL_TIMEOUT
+                )));
+            }
 
             () = std::future::ready(()), if can_replay => {
                 if let (Some(tx), Some(payload)) = (&data_tx, backlog.pop_front()) {
@@ -431,7 +480,8 @@ async fn session(
     // writer is aborted instead of delaying teardown.
     drop(data_tx);
     match &outcome {
-        Ok(Session::Cancelled(_) | Session::ConsumerGone | Session::Fatal(_)) | Err(_) => {
+        Ok(Session::Cancelled(_) | Session::ConsumerGone | Session::Fatal(_) | Session::Stalled(_))
+        | Err(_) => {
             data_writer.abort();
         }
         Ok(Session::PeerBye) => {
@@ -464,6 +514,12 @@ async fn session(
         }
         Ok(Session::ConsumerGone) => {
             net::close_intentional(conn, net::close::CONSUMER_GONE, "consumer gone");
+            tokio::time::sleep(net::CLOSE_PROPAGATE).await;
+        }
+        Ok(Session::Stalled(reason)) => {
+            // Tell the peer this is a transport verdict, not a cancellation:
+            // the connection is being dropped, the transfer is not.
+            net::close_intentional(conn, net::close::STALLED, &reason[..reason.len().min(256)]);
             tokio::time::sleep(net::CLOSE_PROPAGATE).await;
         }
         Ok(Session::Fatal(msg)) => {
