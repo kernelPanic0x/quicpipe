@@ -14,7 +14,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
-use crate::protocol::{HandshakePayload, InletToOutlet, MAX_BUFFERED_BYTES, OutletToInlet};
+use crate::protocol::{HandshakePayload, InletToOutlet, MAX_BUFFERED_BYTES, OutletToInlet, SourceEnd};
 use crate::replay::Window;
 use crate::ui::{Phase, Ui, UiConfig};
 use crate::signals::Termination;
@@ -118,14 +118,18 @@ async fn inlet_session(endpoint: &Endpoint, key: &SecretKey, args: InletArgs) ->
                 match net::close_kind(&conn).await {
                     net::CloseKind::App(net::close::DONE, r) => {
                         // Only the in-band `Bye` proves that the outlet
-                        // verified our checksum. A `DONE` close arriving
-                        // without it may be a spurious/transport-level close:
-                        // never turn that into success. This mirrors the
-                        // outlet's refusal to trust `DONE` without `Checksum`.
-                        return Err(eyre!(
-                            "outlet closed with 'done' but never said Bye: \
-                             the transfer may be incomplete ({r})"
-                        ));
+                        // verified the digest; a close code can never be
+                        // success. But it is not a verdict either: the outlet
+                        // only closes after it has heard us hang up, so a
+                        // `DONE` that arrives without `Bye` means the teardown
+                        // overtook the frame (or a handle was dropped, which
+                        // QUIC closes with code 0). Reconnecting costs nothing
+                        // and lets the ordered goodbye decide.
+                        attempt = attempt.saturating_add(1);
+                        ui.phase(Phase::Reconnecting { attempt });
+                        tracing::warn!(
+                            "outlet closed with 'done' ({r}) before its `Bye`; reconnecting"
+                        );
                     }
                     net::CloseKind::App(net::close::CANCELLED, _) => signals::exit(Termination::Interrupt),
                     net::CloseKind::App(net::close::CONSUMER_GONE, _) => signals::exit(Termination::ConsumerGone),
@@ -238,20 +242,38 @@ async fn session(
     signals: &mut mpsc::Receiver<Termination>,
     position: &AtomicU64,
 ) -> Result<Session, Lost> {
-    let (control_send, control_recv) = conn.accept_bi().await.map_err(|e| Lost(e.to_string()))?;
+    // Waiting for the control stream is bounded and interruptible: an outlet
+    // that dialled and then wedged must not leave the producer stuck in an
+    // `accept` it cannot cancel, and Ctrl-C must still work.
+    let control_stream = select! {
+        biased;
+        why = signals.recv() => {
+            return Ok(Session::Cancelled(why.unwrap_or(Termination::Interrupt)));
+        }
+        accepted = timeout(HANDSHAKE_TIMEOUT, conn.accept_bi()) => accepted,
+    };
+    let (control_send, control_recv) = match control_stream {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(Lost(e.to_string())),
+        Err(_) => return Err(Lost("outlet did not open the control stream in time".into())),
+    };
 
     let (to_outlet_tx, to_outlet_rx) = mpsc::channel::<InletToOutlet>(4);
-    let (from_outlet_tx, mut from_outlet_rx) = mpsc::channel::<OutletToInlet>(8);
-    let (faults_tx, mut faults_rx) = mpsc::channel::<String>(2);
+    // Frames and stream failures share one channel, so nothing has to reason
+    // about which of two ready inputs wins (see `link::Inbound`).
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<link::Inbound<OutletToInlet>>(8);
 
-    link::read_half(control_recv, from_outlet_tx, faults_tx.clone());
-    let control_writer = link::write_half(control_send, to_outlet_rx, faults_tx.clone());
+    link::read_half(control_recv, inbound_tx.clone());
+    let control_writer = link::write_half(control_send, to_outlet_rx, inbound_tx.clone());
 
     // The first frame is the outlet saying how much it has written, which is
     // also exactly where it wants us to resume from.
-    let resume_from = match timeout(HANDSHAKE_TIMEOUT, from_outlet_rx.recv()).await {
-        Ok(Some(OutletToInlet::Written(n))) => n,
-        Ok(Some(other)) => return Err(Lost(format!("expected the resume point, got {other:?}"))),
+    let resume_from = match timeout(HANDSHAKE_TIMEOUT, inbound_rx.recv()).await {
+        Ok(Some(link::Inbound::Frame(OutletToInlet::Written(n)))) => n,
+        Ok(Some(link::Inbound::Frame(other))) => {
+            return Err(Lost(format!("expected the resume point, got {other:?}")));
+        }
+        Ok(Some(link::Inbound::Fault(fault))) => return Err(Lost(fault)),
         Ok(None) => return Err(Lost("outlet left before greeting".into())),
         Err(_) => return Err(Lost("outlet did not greet us in time".into())),
     };
@@ -287,9 +309,9 @@ async fn session(
     // writer is inside a large `write_all`, instead of alternating turns.
     let (data_out, data_rx) = mpsc::channel::<Bytes>(8);
     let mut data_tx = Some(data_out);
-    let data_writer = link::write_bytes(data_send, data_rx, faults_tx.clone());
+    let data_writer = link::write_bytes(data_send, data_rx, inbound_tx.clone());
     let mut data_closed = false;
-    let mut checksum_sent = false;
+    let mut end_sent = false;
 
     tracing::info!(
         "outlet connected; resuming from byte {resume_from} \
@@ -299,16 +321,18 @@ async fn session(
     );
 
     let outcome: Result<Session, Lost> = 'session: loop {
-        // The checksum travels on the control stream as soon as the source is
-        // exhausted; the outlet waits for both this frame and the data FIN.
-        if *source_done && !checksum_sent {
+        // The end of the source travels as one frame: its exact length and its
+        // digest. `total` is what lets the outlet check "have I written
+        // everything" against its own cursor instead of depending on the data
+        // stream's FIN crossing a second stream in the right order.
+        if *source_done && !end_sent {
             let checksum = source_checksum.expect("source_done implies a checksum");
-            let _ = timeout(
-                CTRL_GRACE,
-                to_outlet_tx.send(InletToOutlet::Checksum(checksum)),
-            )
-            .await;
-            checksum_sent = true;
+            let end = SourceEnd {
+                total: window.head(),
+                checksum,
+            };
+            let _ = timeout(CTRL_GRACE, to_outlet_tx.send(InletToOutlet::End(end))).await;
+            end_sent = true;
         }
 
         // Once every byte is either replayed or still queued in the data
@@ -327,9 +351,6 @@ async fn session(
         select! {
             biased;
 
-            // A stream task died, which means the connection is gone.
-            Some(fault) = faults_rx.recv() => break 'session Err(Lost(fault)),
-
             why = signals.recv() => {
                 // The control channel is tiny; poll until the writer takes the
                 // cancellation frame rather than betting on one timed send.
@@ -337,14 +358,24 @@ async fn session(
                 break 'session Ok(Session::Cancelled(why.unwrap_or(Termination::Interrupt)));
             }
 
-            Some(msg) = from_outlet_rx.recv() => match msg {
-                OutletToInlet::Written(n) => {
+            // Frames and stream failures share one channel and arrive in the
+            // order they happened, so a fault can never preempt a verdict the
+            // peer already sent (a `Bye` queued while the control read dies).
+            Some(event) = inbound_rx.recv() => match event {
+                link::Inbound::Frame(OutletToInlet::Written(n)) => {
                     window.ack(n);
                     position.fetch_max(n, Ordering::Relaxed);
                 }
-                OutletToInlet::Bye => break 'session Ok(Session::PeerBye),
-                OutletToInlet::Cancel => break 'session Ok(Session::Cancelled(Termination::Interrupt)),
-                OutletToInlet::ConsumerGone => break 'session Ok(Session::ConsumerGone),
+                link::Inbound::Frame(OutletToInlet::Bye) => break 'session Ok(Session::PeerBye),
+                link::Inbound::Frame(OutletToInlet::Cancel) => {
+                    break 'session Ok(Session::Cancelled(Termination::Interrupt));
+                }
+                link::Inbound::Frame(OutletToInlet::ConsumerGone) => {
+                    break 'session Ok(Session::ConsumerGone);
+                }
+                // A stream task died: the transport is gone, nothing more. The
+                // caller decides whether that is worth reconnecting.
+                link::Inbound::Fault(fault) => break 'session Err(Lost(fault)),
             },
 
             () = std::future::ready(()), if can_replay => {

@@ -163,11 +163,11 @@ fn writer(
 /// continuity comes from the drained cursor in the handshake, never from
 /// per-chunk offsets. A chunk read but not yet queued when the connection dies
 /// is simply replayed by the inlet.
-pub fn pump(
+pub fn pump<I: Send + 'static>(
     mut recv: RecvStream,
     sink: mpsc::Sender<Msg>,
     data_end: mpsc::Sender<()>,
-    faults: mpsc::Sender<String>,
+    faults: mpsc::Sender<crate::link::Inbound<I>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -185,7 +185,7 @@ pub fn pump(
                     return;
                 }
                 Err(e) => {
-                    let _ = faults.try_send(format!("read data: {e}"));
+                    let _ = faults.try_send(crate::link::Inbound::Fault(format!("read data: {e}")));
                     return;
                 }
             }

@@ -89,6 +89,13 @@ impl Window {
         }
     }
 
+    /// Total bytes produced so far, i.e. the absolute end of the bytes read from
+    /// the source. Replay never moves it, so once the source is exhausted this
+    /// is the `total` the `End` frame announces.
+    pub fn head(&self) -> u64 {
+        self.head
+    }
+
     /// Unacknowledged bytes. This is the memory bound, and the thing whose limit
     /// stops the reader — which is what gives a stdin source its backpressure.
     pub fn unacked(&self) -> u64 {

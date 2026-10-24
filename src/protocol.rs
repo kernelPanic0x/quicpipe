@@ -84,16 +84,28 @@ impl<T: Encoder> Decoder for WireCodec<T> {
     }
 }
 
+/// The end of the inlet's source, as a single fact: how many bytes it produced
+/// and their XXH3-64 digest.
+///
+/// Both fields are needed together. `total` turns "the stream ended" into an
+/// exact predicate the outlet can check against its own cursor
+/// (`written == total`), which is what keeps the raw data stream's FIN from
+/// being load-bearing; `checksum` is the end-to-end integrity verdict.
+#[derive(SchemaWrite, SchemaRead, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceEnd {
+    pub total: u64,
+    pub checksum: u64,
+}
+
 #[derive(SchemaWrite, SchemaRead, Debug, Clone)]
 pub enum InletToOutlet {
-    /// End-to-end integrity verdict: the XXH3-64 digest of everything the
-    /// inlet's source produced. It travels on the control stream; the raw data
-    /// stream ends with FIN. The outlet compares the digest against the hash of
-    /// the bytes it actually wrote; any mismatch — a skipped or duplicated
-    /// byte, a bad resume, anything QUIC's per-stream ordering could not see
-    /// across a reconnect — fails the transfer loudly.
+    /// End of the source, announced once per connection when the source is
+    /// exhausted: its exact length and the XXH3-64 digest of every byte the
+    /// inlet produced. Any mismatch — a skipped or duplicated byte, a bad
+    /// resume, anything QUIC's per-stream ordering could not see across a
+    /// reconnect — fails the transfer loudly.
     #[wincode(tag = 0)]
-    Checksum(u64),
+    End(SourceEnd),
     /// The outlet no longer wants the bytes. The inlet stops its source and
     /// exits with the cancellation code; nothing is wrong with the stream.
     #[wincode(tag = 1)]
@@ -148,7 +160,15 @@ mod tests {
     fn frame_tags_are_frozen() {
         let tag = |frame: &[u8]| <[u8; 4]>::try_from(frame.get(..4).unwrap()).unwrap();
 
-        assert_eq!(tag(&InletToOutlet::Checksum(7).encode().unwrap()), [0, 0, 0, 0]);
+        assert_eq!(
+            tag(&InletToOutlet::End(SourceEnd {
+                total: 7,
+                checksum: 9
+            })
+            .encode()
+            .unwrap()),
+            [0, 0, 0, 0]
+        );
         assert_eq!(tag(&InletToOutlet::Cancel.encode().unwrap()), [1, 0, 0, 0]);
         assert_eq!(
             tag(&InletToOutlet::Fatal("x".into()).encode().unwrap()),
