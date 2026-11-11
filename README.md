@@ -39,13 +39,13 @@ On the wire there are two streams per connection: a small framed control stream 
 On the sending machine (this prints a wormhole code, e.g. `7-crimson-otter`):
 
 ```sh
-quicpipe inlet backup.tar.gz
+quicpipe inlet /dev/sda1
 ```
 
 On the receiving machine:
 
 ```sh
-quicpipe outlet backup.tar.gz
+quicpipe outlet sda1.img
 ```
 
 ### Stream a live command output
@@ -53,28 +53,14 @@ quicpipe outlet backup.tar.gz
 Anything you can pipe, you can send. On the sending side:
 
 ```sh
-tar cz . | quicpipe inlet
+tar c --zstd . | quicpipe inlet
 ```
 
 On the receiving side:
 
 ```sh
-quicpipe outlet | tar xz
+quicpipe outlet | tar x --zstd
 ```
-
-### Work with files instead of stdin/stdout
-
-Both sides accept a path argument instead of the default `-` (stdin/stdout):
-
-```sh
-# sending side
-quicpipe inlet dump.sql
-
-# receiving side
-quicpipe outlet restored.sql
-```
-
-You can also set the wormhole code via the environment: `QUICPIPE_CODE`, and the rendezvous server via `WORMHOLE_MAILBOX_URL`.
 
 ### Progress and sizes
 
